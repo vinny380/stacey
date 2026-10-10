@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "composio": {
+      "enabled": false,
+      "description": "Google Gmail email, two Google calendars, Google Sheets spreadsheets, Drive files, Slack messages and account connections via Composio",
+      "url": "https://connect.composio.dev/mcp",
+      "transport": "http",
+      "headers": { "x-consumer-api-key": "${COMPOSIO_API_KEY}" }
+    },
+    "custom-remote": {
+      "enabled": false,
+      "description": "Replace with the services and capabilities of your remote MCP server",
+      "url": "https://your-server.example/mcp",
+      "transport": "http",
+      "headers": { "Authorization": "Bearer ${CUSTOM_MCP_TOKEN}" }
+    },
+    "custom-local": {
+      "enabled": false,
+      "description": "Replace with the services and capabilities of your local MCP server",
+      "command": "/absolute/path/to/python",
+      "args": ["/absolute/path/to/your_mcp_server.py"],
+      "cwd": "/absolute/path/to/server-project",
+      "env": { "SERVICE_API_KEY": "${CUSTOM_SERVICE_KEY}" }
+    }
+  }
+}
