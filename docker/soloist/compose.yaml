@@ -1,0 +1,20 @@
+services:
+  soloist:
+    build:
+      context: .
+    image: stacy-soloist:local
+    container_name: stacy-soloist
+    init: true
+    environment:
+      SOLOIST_API_KEY: ${SOLOIST_API_KEY:?Set SOLOIST_API_KEY in your local .env}
+      SOLOIST_DEVICE_NAME: Stacy
+    ports:
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:4714:4714"
+      # Spotify Connect pairing on the LAN; no playback control API is exposed here.
+      - "24879:24879"
+    volumes:
+      - soloist-data:/home/stacy/.local/share/soloist
+volumes:
+  soloist-data:
+    name: stacy-soloist-data

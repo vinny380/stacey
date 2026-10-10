@@ -1,0 +1,4 @@
+load-module module-native-protocol-unix socket=/tmp/stacy-runtime/pulse/native
+load-module module-null-sink sink_name=stacy rate=48000 channels=2
+set-default-sink stacy
+load-module module-simple-protocol-tcp listen=0.0.0.0 port=4714 source=stacy.monitor record=true playback=false rate=48000 format=s16le channels=2
