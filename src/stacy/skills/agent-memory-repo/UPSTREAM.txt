@@ -1,0 +1,4 @@
+Source: https://github.com/AgentMemoryRepo/agentmemoryrepo
+Revision: 8798cb26c817d451a5ed6cba0ad8d9eca8d5ec3e
+License: MIT
+SKILL.md and SPEC.md are unmodified upstream files.
