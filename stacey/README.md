@@ -61,8 +61,8 @@ indicator until her reply finishes. Status-signal failures do not block the requ
 - `src/spectrum-interface.ts`: reusable Spectrum adapter, with sender and space policies.
 - `src/imessage.ts`: `IMessageInterface` configures the iMessage provider and DM-only policy.
 - `src/client.ts`: authenticated client for the shared local assistant service.
-- `../src/stacy/agent.py`: `Agent` protocol, normalized `AgentMessage` and `TextAgent` tool loop.
-- `../src/stacy/agent_instructions.py`: common instructions consumed by text and voice.
+- `../src/stacy/harness/text.py`: `Agent` protocol, normalized `AgentMessage` and `TextAgent` tool loop.
+- `../src/stacy/harness/instructions.py`: common instructions consumed by text and voice.
 
 For Slack or Telegram, add a provider adapter extending `SpectrumInterface` with the
 appropriate account and conversation policy, then pass it to `InterfaceRunner`. Providers

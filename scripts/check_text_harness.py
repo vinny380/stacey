@@ -19,11 +19,11 @@ from unittest.mock import patch
 
 from fastmcp import FastMCP
 
-from stacy.agent import AgentMessage, TextAgent
-from stacy.agent_instructions import SPOTIFY_ROUTING, instructions
-from stacy.composio_context import json_result
-from stacy.config import Settings
-from stacy.spotify_workflow import SpotifyWorkflow
+from stacy.connections.results import result_object
+from stacy.harness.instructions import SPOTIFY_ROUTING, instructions
+from stacy.harness.text import AgentMessage, TextAgent
+from stacy.integrations.spotify.workflow import SpotifyWorkflow
+from stacy.runtime.settings import Settings
 
 
 def schema(properties, required=()):
@@ -339,11 +339,11 @@ async def evaluate(
                         "search_mcp_tools",
                         {"server": "composio", "query": "search schemas execute"},
                     )
-                return {t["name"]: t["inputSchema"] for t in json_result(result)["tools"]}
+                return {t["name"]: t["inputSchema"] for t in result_object(result)["tools"]}
 
             SpotifyWorkflow(invoke, metadata=metadata).register(tools, playlist=playlist is True)
         if index:
-            from stacy.tool_index import TOOL_INDEX_URI
+            from stacy.harness.tool_index import TOOL_INDEX_URI
 
             @tools.resource(TOOL_INDEX_URI)
             def capability_index():
@@ -378,7 +378,7 @@ async def evaluate(
                     value = instructions(*args, **kwargs)
                     return value if routing is not False else value.replace(SPOTIFY_ROUTING, "")
 
-                with patch("stacy.agent.instructions", prompt):
+                with patch("stacy.harness.text.instructions", prompt):
                     await agent.respond(message)
                 elapsed = time.perf_counter() - started
                 calls = state["calls"][begin:]

@@ -364,7 +364,7 @@ Provider acceptance confirms the text send. Stable Pi callback/identity provisio
 remains deployment work.
 The production voice pipeline also verified a Stanley reply and Frank Sinatra playback
 on the owner's Echo Show 5 after fixing the local transport's invalid session after restart.
-The [backend restart regression](tests/test_voice_backend_restart.py) verifies tool use
+The [backend restart regression](tests/harness/test_voice_restart.py) verifies tool use
 after an idle backend restart.
 
 ### Composio account connections
@@ -407,14 +407,14 @@ The LLM interprets requests and calls tools to manage timers and alarms. Once sc
 
 Use [Agent Memory Repo](https://cognition.com/agent-memory-repo) for the MVP. A separate local Git repository is the source of truth for durable personal knowledge. Keep it outside Stacy's source checkout and outside disposable E2B sandboxes. Its path is configurable so the same data can move to a Raspberry Pi.
 
-Follow the [upstream format](https://github.com/AgentMemoryRepo/agentmemoryrepo/blob/main/SPEC.md): a compact `MEMORY.md` entry point, linked topic notes, and source and date metadata. The upstream skill and specification are vendored unchanged under `src/stacy/skills/agent-memory-repo`, with their MIT license and provenance, pinned to `8798cb26c817d451a5ed6cba0ad8d9eca8d5ec3e`.
+Follow the [upstream format](https://github.com/AgentMemoryRepo/agentmemoryrepo/blob/main/SPEC.md): a compact `MEMORY.md` entry point, linked topic notes, and source and date metadata. The upstream skill and specification are vendored unchanged under `src/stacy/memory/skills/agent-memory-repo`, with their MIT license and provenance, pinned to `8798cb26c817d451a5ed6cba0ad8d9eca8d5ec3e`.
 
 ## Reuse and integration
 
 Use Pipecat for conversation context and asynchronous tool execution. Use FastMCP's existing `SkillsDirectoryProvider` and `ResourcesAsTools` transform to make skill instructions discoverable and readable. Expose narrowly scoped file, search, and Git tools for the configured memory repository.
 
 Voice and text share a bounded skill catalog containing names, descriptions and resource URIs.
-Calendar, tasks, Spotify and connected-app workflows live under `src/stacy/skills`; only the
+Calendar, tasks, Spotify and connected-app workflows live under `src/stacy/harness/skills`; only the
 selected recipe is loaded through `read_resource`. Calendar instructions use complete local
 day boundaries and an explicit Google account. Task instructions resolve the user's intended
 service/list before creating a task. Recipes reuse complete schemas, sessions and account/device
@@ -483,16 +483,18 @@ Supermemory is deferred for the MVP. File search and linked navigation are the i
 
 ```text
 src/stacy/
-  cli.py           process lifecycle and development commands
-  voice.py         Pipecat pipeline, conversation instructions, MCP connection
-  tools.py         alarm/memory tools and upstream skill provider
-  alarms.py        durable alarm state and scheduler
-  sound.py         local alarm playback
-  memory.py        separate personal Git repository
-  integrations.py  Exa and E2B SDK adapters
-  spotify.py       local OAuth callback and Spotify tools
-  skills/          vendored upstream instructions
-tests/             offline scheduler, persistence and integration checks
+  harness/         text/voice loops, instructions, context, history and tracing
+    audio/         speaker turn taking, transport selection and native macOS audio
+    skills/        calendar, task, music and connection workflow instructions
+  connections/     MCP discovery, account state, remote authorization and verification
+  integrations/
+    messaging/     authenticated iMessage bridge and outbound handoffs
+    spotify/       verified workflows, shared playback, Web API and Soloist adapters
+    registration.py  Exa search and E2B Python tools
+  memory/          personal Git repository, note retrieval and vendored skills
+  alarms/          persistent alarm scheduler and local audio playback
+  runtime/         settings, process lifecycle, tool wiring and private storage
+tests/             mirrors the source folders; offline checks use temporary state
 ```
 
 State defaults to `~/.local/share/stacy` (or `$XDG_DATA_HOME/stacy`). Set `STACY_DATA_DIR` and `STACY_MEMORY_DIR` to relocate it. Memory must remain outside the source checkout, in its own Git repository. Writes use revision checks, serialization and local commits; no remote is required. Keep operational state and personal memory when moving machines, and reinstall platform audio dependencies on the destination.

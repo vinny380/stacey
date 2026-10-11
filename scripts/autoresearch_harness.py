@@ -19,7 +19,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from scripts.check_text_harness import evaluate
-from stacy.config import Settings
+from stacy.runtime.settings import Settings
 
 
 @dataclass(frozen=True)
@@ -72,12 +72,12 @@ def decision(baseline: list[dict], candidate: list[dict], *, objective: str = "l
 def source_hash() -> str:
     root = Path(__file__).resolve().parents[1]
     sources = [
-        "src/stacy/agent.py",
-        "src/stacy/agent_instructions.py",
-        "src/stacy/spotify_workflow.py",
-        "src/stacy/mcp_gateway.py",
-        "src/stacy/composio_context.py",
-        "src/stacy/tool_index.py",
+        "src/stacy/harness/text.py",
+        "src/stacy/harness/instructions.py",
+        "src/stacy/integrations/spotify/workflow.py",
+        "src/stacy/connections/gateway.py",
+        "src/stacy/connections/composio.py",
+        "src/stacy/harness/tool_index.py",
         "scripts/check_text_harness.py",
     ]
     digest = sha256()
@@ -108,12 +108,12 @@ async def research(
             "-m",
             "pytest",
             "-q",
-            "tests/test_spotify_workflow.py",
-            "tests/test_text_harness_eval.py",
-            "tests/test_mcp_gateway.py",
-            "tests/test_agent.py",
-            "tests/test_working_context.py",
-            "tests/test_tool_index.py",
+            "tests/integrations/spotify/test_workflow.py",
+            "tests/harness/test_eval.py",
+            "tests/connections/test_gateway.py",
+            "tests/harness/test_text.py",
+            "tests/harness/test_working_context.py",
+            "tests/harness/test_tool_index.py",
         ],
         check=True,
     )

@@ -30,15 +30,19 @@ from pipecat.services.openai.realtime.events import (
     ItemContent,
     ResponseCreateEvent,
 )
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.workers.runner import WorkerRunner
 
-from stacy.alarms import AlarmService
-from stacy.config import Settings
-from stacy.memory import MemoryRepo
-from stacy.tools import create_tools
-from stacy.tracing import VoiceTrace
-from stacy.voice import build_voice_pipeline, create_voice_worker, openai_key
+from stacy.alarms.service import AlarmService
+from stacy.harness.tracing import VoiceTrace
+from stacy.harness.voice import (
+    build_voice_pipeline,
+    create_voice_worker,
+    openai_key,
+    startup_context,
+)
+from stacy.memory.repository import MemoryRepo
+from stacy.runtime.settings import Settings
+from stacy.runtime.tools import create_tools
 
 
 def entries(trace):
@@ -90,14 +94,16 @@ async def session(settings, prompts, *, audio=False):
                     await super().process_frame(frame, direction)
 
             incoming, outgoing = Passthrough(), Output()
+            context = await startup_context(f"http://127.0.0.1:{port}/mcp")
             pipeline = build_voice_pipeline(
                 settings,
                 openai_key(),
                 await mcp.tools(),
                 SimpleNamespace(input=lambda: incoming, output=lambda: outgoing),
                 trace=trace,
+                context=context,
             )
-            llm = next(p for p in pipeline.processors if isinstance(p, OpenAIRealtimeLLMService))
+            llm = pipeline.llm
             worker = create_voice_worker(pipeline, trace=trace)
             runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
             await runner.add_workers(worker)
