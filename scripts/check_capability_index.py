@@ -12,9 +12,9 @@ from pathlib import Path
 
 from scripts.autoresearch_harness import decision, source_hash
 from scripts.check_text_harness import fixture_tools
-from stacy.agent import AgentMessage, TextAgent
-from stacy.config import Settings
-from stacy.tool_index import TOOL_INDEX_URI
+from stacy.harness.text import AgentMessage, TextAgent
+from stacy.harness.tool_index import TOOL_INDEX_URI
+from stacy.runtime.settings import Settings
 
 
 async def evaluate(settings, indexed, repeat, output):

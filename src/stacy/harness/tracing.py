@@ -1,0 +1,364 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+from stacy.connections.results import OBJECT, JsonObject
+
+logger = logging.getLogger(__name__)
+
+
+class Verification(BaseModel):
+    confirmed: bool = True
+
+
+class ProviderOutcome(BaseModel):
+    successful: bool | None = None
+    is_error: bool = False
+    stacy_verification: Verification = Field(default_factory=Verification)
+
+    @property
+    def failed(self) -> bool:
+        return self.successful is False or self.is_error or not self.stacy_verification.confirmed
+
+
+class BatchOutcome(ProviderOutcome):
+    response: ProviderOutcome = Field(default_factory=ProviderOutcome)
+
+
+def provider_failed(value: JsonObject) -> bool:
+    """Inspect provider envelopes, never arbitrary business records."""
+    try:
+        if ProviderOutcome.model_validate(value).failed:
+            return True
+        envelope = value.get("structured_content") or value.get("data") or value
+        envelope = OBJECT.validate_python(envelope)
+        if ProviderOutcome.model_validate(envelope).failed:
+            return True
+        results = TypeAdapter(list[BatchOutcome]).validate_python(envelope.get("results", []))
+    except ValidationError:
+        return False
+    return any(entry.failed or entry.response.failed for entry in results)
+
+
+def telemetry_json(span) -> str:
+    """Export timing/usage from native spans without serializing private prompts."""
+    safe = {
+        "service.name",
+        "conversation.id",
+        "turn.number",
+        "function_name",
+        "tool.name",
+        "gen_ai.system",
+        "gen_ai.request.model",
+        "gen_ai.response.model",
+    }
+    attributes = {
+        key: value
+        for key, value in (span.attributes or {}).items()
+        if key in safe
+        or (
+            isinstance(value, (int, float, bool))
+            and any(word in key for word in ("tokens", "duration", "latency", "ttfb", "usage"))
+            and not ("duration" in key and value < 0)
+        )
+    }
+    context = span.context
+    data = {
+        "name": span.name,
+        "start_time": span.start_time,
+        "end_time": span.end_time,
+        "context": {"trace_id": f"{context.trace_id:032x}", "span_id": f"{context.span_id:016x}"}
+        if context
+        else None,
+        "parent_id": f"{span.parent.span_id:016x}" if span.parent else None,
+        "attributes": attributes,
+        "events": [],
+        "status": {"status_code": span.status.status_code.name},
+        "resource": {"attributes": {"service.name": "stacy"}, "schema_url": ""},
+    }
+    return json.dumps(data) + "\n"
+
+
+@contextmanager
+def local_telemetry(trace, *, enabled: bool = True):
+    """Use Pipecat's OpenTelemetry setup and the SDK's standard file exporter."""
+    if not enabled:
+        yield False
+        return
+
+    from opentelemetry import trace as otel
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+    from pipecat.utils.tracing.setup import setup_tracing
+
+    path = trace.path.with_name(trace.path.name.replace("voice-", "otel-", 1))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as output:
+        exporter = ConsoleSpanExporter(out=output, formatter=telemetry_json)
+        if not setup_tracing(service_name="stacy", exporter=exporter):
+            raise RuntimeError("Pipecat OpenTelemetry setup failed")
+        logger.info("OpenTelemetry trace: %s", path)
+        try:
+            yield True
+        finally:
+            # The SDK flushes its batch exporter before the local file is closed.
+            otel.get_tracer_provider().shutdown()
+
+
+class VoiceTrace:
+    """Local, owner-only conversation/tool traces; no raw audio or system prompts."""
+
+    def __init__(self, data_dir: Path, *, prefix: str = "voice"):
+        directory = data_dir / "traces"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        self.path = directory / f"{prefix}-{stamp}-{uuid4().hex[:8]}.jsonl"
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+
+    def record(self, event: str, **fields) -> None:
+        entry = {"time": datetime.now(UTC).isoformat(), "event": event, **fields}
+        with self.path.open("a") as file:
+            file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def attach_assistant_transcripts(llm, trace: VoiceTrace) -> None:
+    # Pipecat reports a completed item through both item.done and response.done.
+    # Deduplicate those notifications by item ID; distinct repeated replies remain visible.
+    recorded: dict[str, tuple[str, str | None]] = {}
+
+    @llm.event_handler("on_conversation_item_updated")
+    async def item_updated(service, item_id, item):
+        if item is None or item.type != "message" or item.role != "assistant":
+            return
+        text = "".join(part.transcript or part.text or "" for part in item.content or [])
+        if not text or recorded.get(item_id) == (text, item.status):
+            return
+        recorded[item_id] = (text, item.status)
+        trace.record("assistant_transcript", item_id=item_id, status=item.status, text=text)
+        logger.info("Stacy: %s", text)
+
+
+def trace_observers(trace: VoiceTrace) -> list:
+    from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        InterruptionFrame,
+        TranscriptionFrame,
+        UserStartedSpeakingFrame,
+        UserStoppedSpeakingFrame,
+    )
+    from pipecat.observers.base_observer import BaseObserver
+    from pipecat.observers.error_observer import ErrorObserver
+    from pipecat.observers.function_call_observer import FunctionCallObserver
+    from pipecat.processors.frame_processor import FrameDirection
+
+    calls = FunctionCallObserver(include_arguments=True, include_results=True)
+    account_calls: set[str] = set()
+
+    @calls.event_handler("on_function_call_event")
+    async def tool_event(observer, event):
+        fields = event.model_dump(mode="json", exclude_none=True)
+        kind = fields.pop("kind")
+        if event.function_name in {"send_text", "connect_mcp"}:
+            fields.pop("arguments", None)
+        # Account tools must never put credentials into diagnostic files.
+        if event.function_name == "call_mcp_tool" and event.arguments is not None:
+            if event.arguments.get("tool") == "COMPOSIO_MANAGE_CONNECTIONS":
+                account_calls.add(event.tool_call_id)
+        # Pipecat's completion events omit arguments; retain the call identity
+        # from its start/progress event to redact authorization links on completion.
+        account_result = event.tool_call_id in account_calls
+        if (
+            event.function_name.startswith("spotify_")
+            or account_result
+            or event.function_name
+            in {
+                "recent_texts",
+                "connection_status",
+                "connect_mcp",
+                "list_connections",
+                "verify_connection",
+                "reconnect_connection",
+                "disconnect_connection",
+            }
+        ):
+            fields.pop("result", None)
+        if kind in {
+            "function_call_completed",
+            "function_call_failed",
+            "function_call_cancelled",
+            "function_call_timed_out",
+        }:
+            account_calls.discard(event.tool_call_id)
+        if event.in_progress_at is not None and kind != "function_call_in_progress":
+            duration = event.timestamp - event.in_progress_at
+            if duration >= 0:
+                fields["execution_seconds"] = duration
+        trace.record(kind, **{key: diagnostic_value(value) for key, value in fields.items()})
+        logger.info("%s: %s [%s]", kind, event.function_name, event.tool_call_id)
+        # The MCP adapter can return an isError response as text rather than
+        # raising. Preserve that distinction from a successful function return.
+        if not isinstance(event.result, str):
+            return
+        if event.result.startswith("Error") or event.result == "Sorry, could not call the mcp tool":
+            error = diagnostic_value(event.result)
+            trace.record(
+                "tool_reported_error",
+                function_name=event.function_name,
+                tool_call_id=event.tool_call_id,
+                error=error,
+            )
+            logger.warning("Tool %s returned an error: %s", event.function_name, error)
+            return
+        try:
+            raw, _ = json.JSONDecoder().raw_decode(event.result.lstrip())
+            result = OBJECT.validate_python(raw)
+        except (ValueError, ValidationError):
+            return
+        if provider_failed(result):
+            trace.record(
+                "tool_reported_error",
+                function_name=event.function_name,
+                tool_call_id=event.tool_call_id,
+                error="Provider reported failure or action verification uncertainty",
+            )
+
+    errors = ErrorObserver()
+
+    @errors.event_handler("on_error")
+    async def error_event(observer, event):
+        trace.record(
+            "pipeline_error", **diagnostic_value(event.model_dump(mode="json", exclude_none=True))
+        )
+
+    class SpeechObserver(BaseObserver):
+        def __init__(self):
+            super().__init__(observe_every_push=False)
+            self.user_finished = None
+            self.first_audio = False
+
+        async def on_push_frame(self, data):
+            frame = data.frame
+            if (
+                frame.broadcast_sibling_id is not None
+                and data.direction != FrameDirection.DOWNSTREAM
+            ):
+                return
+            if isinstance(frame, TranscriptionFrame):
+                trace.record("user_transcript", text=frame.text)
+                logger.info("You: %s", frame.text)
+                return
+            if isinstance(frame, UserStoppedSpeakingFrame):
+                self.user_finished, self.first_audio = data.timestamp, False
+            elif isinstance(frame, UserStartedSpeakingFrame):
+                self.user_finished = None
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                if self.user_finished is not None:
+                    duration = (data.timestamp - self.user_finished) / 1e9
+                    if duration >= 0:
+                        trace.record(
+                            "response_audio_latency",
+                            seconds=duration,
+                            first_audio=not self.first_audio,
+                        )
+                    self.first_audio = True
+            elif not isinstance(frame, (BotStoppedSpeakingFrame, InterruptionFrame)):
+                return
+            trace.record(type(frame).__name__, pipeline_time_ns=data.timestamp)
+
+    return [calls, errors, SpeechObserver()]
+
+
+active_text_trace: ContextVar[TextTrace | None] = ContextVar("active_text_trace", default=None)
+
+_SECRET_KEY = re.compile(
+    r"secret|token|password|authorization|credential|api.?key|cookie|auth.?url|redirect.?url|headers",
+    re.I,
+)
+_SECRET_TEXT = re.compile(
+    r"(?:Bearer\s+\S+|\b(?:sk-|ck_)[A-Za-z0-9_.-]+|https?://[^\s\"<>]+)", re.I
+)
+
+
+def diagnostic_value(value, *, depth=0):
+    """Bound and redact provider payloads, including JSON embedded in MCP text."""
+    if depth > 10:
+        return "<depth limit>"
+    if isinstance(value, dict):
+        result = {}
+        for key, item in list(value.items())[:60]:
+            result[key] = (
+                "<REDACTED>"
+                if _SECRET_KEY.search(str(key))
+                else diagnostic_value(item, depth=depth + 1)
+            )
+        if len(value) > 60:
+            result["_omitted_fields"] = len(value) - 60
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [diagnostic_value(item, depth=depth + 1) for item in value[:30]]
+        if len(value) > 30:
+            result.append({"_omitted_items": len(value) - 30})
+        return result
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return diagnostic_value(parsed, depth=depth + 1)
+        for name, secret in os.environ.items():
+            if _SECRET_KEY.search(name) and len(secret) >= 8:
+                value = value.replace(secret, "<REDACTED>")
+        value = _SECRET_TEXT.sub("<REDACTED>", value)
+        return value[:4000] + ("<truncated>" if len(value) > 4000 else "")
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return "<unsupported value>"
+
+
+class TextTrace(VoiceTrace):
+    """Bounded, redacted diagnostics; no prompts, chat transcripts or credentials."""
+
+    def __init__(self, data_dir: Path):
+        super().__init__(data_dir, prefix="text")
+
+    def record(self, event: str, **fields) -> None:
+        super().record(event, **{key: diagnostic_value(value) for key, value in fields.items()})
+
+    @contextmanager
+    def activate(self):
+        token = active_text_trace.set(self)
+        try:
+            yield
+        finally:
+            active_text_trace.reset(token)
+
+    @contextmanager
+    def measure(self, event: str, **fields):
+        started = time.perf_counter()
+        try:
+            yield
+        except BaseException as error:
+            self.record(
+                event,
+                seconds=time.perf_counter() - started,
+                status="failed",
+                error_type=type(error).__name__,
+                http_status=getattr(error, "status_code", None),
+                **fields,
+            )
+            raise
+        else:
+            self.record(event, seconds=time.perf_counter() - started, status="complete", **fields)
