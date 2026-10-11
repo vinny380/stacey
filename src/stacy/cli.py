@@ -46,6 +46,13 @@ async def existing_backend(port: int) -> bool:
         raise RuntimeError(f"Port {port} is already used by another service")
 
 
+def backend_http_app(tools):
+    """Construct the local transport shared by voice, messaging and developer clients."""
+    # All durable state belongs to application services. Voice must not hold a
+    # transport session that disappears when the local backend is restarted.
+    return tools.http_app(path="/mcp", stateless_http=True)
+
+
 async def serve(settings: Settings, port: int, with_voice: bool) -> None:
     import uvicorn
 
@@ -69,6 +76,7 @@ async def serve(settings: Settings, port: int, with_voice: bool) -> None:
             alarms,
             memory,
             mcp_config=settings.mcp_config,
+            prewarm_spotify=True,
         )
         spotify_backend = os.environ.get("STACY_SPOTIFY_BACKEND", "auto")
         if spotify_backend not in {"auto", "webapi", "soloist"}:
@@ -119,10 +127,11 @@ async def serve(settings: Settings, port: int, with_voice: bool) -> None:
 
         server = uvicorn.Server(
             uvicorn.Config(
-                tools.http_app(path="/mcp"),
+                backend_http_app(tools),
                 host="127.0.0.1",
                 port=port,
                 log_level="warning",
+                access_log=False,
             )
         )
 

@@ -108,6 +108,47 @@ def test_failed_turn_is_not_reexecuted(tmp_path):
     asyncio.run(scenario())
 
 
+def test_cacheable_prompt_keeps_dynamic_time_memory_and_source_after_breakpoint(tmp_path):
+    from stacy.agent_instructions import instructions
+
+    settings = Settings(tmp_path, tmp_path / "memory")
+    prompt = instructions(
+        settings,
+        channel="imessage",
+        memory_source="imessage message private-id",
+        retrieved_notes={"profile.md": "Name is Vinny"},
+        cacheable=True,
+    )
+    prefix, marker, context = prompt.partition("\n<current_turn_context>\n")
+    assert marker
+    assert "Today is" not in prefix
+    assert "private-id" not in prefix and "Name is Vinny" not in prefix
+    assert "Today is" in context and "private-id" in context and "Name is Vinny" in context
+
+    async def scenario():
+        tools = FastMCP("test")
+
+        @tools.tool
+        def set_timer(seconds: int):
+            return {"saved": True}
+
+        model = Model()
+        agent = TextAgent(settings, tools, model_client=model, cache_prompt=True)
+        await agent.respond(AgentMessage("imessage", "dm", "owner", "1", "Set a timer"))
+        first, second = model.requests
+        assert first["instructions"] is None and second["instructions"] is None
+        assert first["input"][0] == second["input"][0]
+        assert first["input"][0]["role"] == "developer"
+        block = first["input"][0]["content"][0]
+        assert block["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "Today is" not in block["text"]
+        assert "Today is" in first["input"][1]["content"]
+        assert first["input"][2]["content"] == "Set a timer"
+        await agent.close()
+
+    asyncio.run(scenario())
+
+
 def test_bridge_authentication_and_validation():
     class FakeAgent:
         def __init__(self):
@@ -224,5 +265,56 @@ def test_linked_profile_is_loaded_before_model_answers_identity_question(tmp_pat
             )
         finally:
             await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_text_traces_capture_model_tools_usage_and_hide_payloads(tmp_path):
+    async def scenario():
+        tools = FastMCP("test")
+
+        @tools.tool
+        def set_timer(seconds: int):
+            return {"saved": True, "secret": "provider-secret"}
+
+        class UsageModel(Model):
+            async def create(self, **kwargs):
+                response = await super().create(**kwargs)
+                response.usage = SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=5,
+                    total_tokens=15,
+                    output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+                    input_tokens_details=SimpleNamespace(cached_tokens=2),
+                )
+                return response
+
+        agent = TextAgent(Settings(tmp_path, tmp_path / "memory"), tools, model_client=UsageModel())
+        try:
+            await agent.respond(
+                AgentMessage(
+                    "imessage", "private-dm", "private-owner", "private-id", "private-message"
+                )
+            )
+        finally:
+            await agent.close()
+        (path,) = (tmp_path / "traces").glob("text-*.jsonl")
+        raw = path.read_text()
+        events = [json.loads(line) for line in raw.splitlines()]
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert [e["event"] for e in events].count("model_request") == 2
+        assert any(e["event"] == "tool_request" and e["tool"] == "set_timer" for e in events)
+        assert any(e["event"] == "model_usage" and e["reasoning_tokens"] == 3 for e in events)
+        assert events[-1]["event"] == "turn" and events[-1]["status"] == "complete"
+        assert all(e["seconds"] >= 0 for e in events if "seconds" in e)
+        for secret in (
+            "private-dm",
+            "private-owner",
+            "private-id",
+            "private-message",
+            "provider-secret",
+            "Timer set.",
+        ):
+            assert secret not in raw
 
     asyncio.run(scenario())

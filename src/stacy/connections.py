@@ -7,7 +7,7 @@ from pathlib import Path
 from stacy.mcp_gateway import MCPGateway
 
 DESCRIPTION = (
-    "Google Gmail email, Calendar events, Sheets spreadsheets, Drive files and Slack messages"
+    "Spotify music/playback; Google Gmail email, Calendar events, Sheets, Drive and Slack messages"
 )
 CONSUMER_MCP_URL = "https://connect.composio.dev/mcp"
 

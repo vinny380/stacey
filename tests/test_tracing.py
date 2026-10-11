@@ -178,3 +178,78 @@ def test_consumer_account_links_are_not_recorded_in_tool_results(tmp_path):
         assert link not in trace.path.read_text()
 
     asyncio.run(scenario())
+
+
+def test_text_diagnostics_redact_nested_json_links_env_and_bound_payloads(tmp_path, monkeypatch):
+    from stacy.tracing import TextTrace
+
+    monkeypatch.setenv("CUSTOM_API_KEY", "opaque-configured-secret")
+    trace = TextTrace(tmp_path)
+    trace.record(
+        "payload",
+        result={
+            "content": json.dumps(
+                {
+                    "client_secret": "hidden-client-secret",
+                    "url": "https://provider.test/auth?code=private-code",
+                    "message": "failed with opaque-configured-secret",
+                    "device": "Echo",
+                }
+            ),
+            "authorization": "Bearer hidden-bearer",
+            "items": list(range(100)),
+        },
+    )
+    raw = trace.path.read_text()
+    for secret in (
+        "hidden-client-secret",
+        "private-code",
+        "opaque-configured-secret",
+        "hidden-bearer",
+    ):
+        assert secret not in raw
+    assert "Echo" in raw and "_omitted_items" in raw
+
+
+def test_key_redaction_preserves_spotify_operation_names():
+    from stacy.tracing import diagnostic_value
+
+    assert diagnostic_value("SPOTIFY_GET_PLAYBACK_STATE") == "SPOTIFY_GET_PLAYBACK_STATE"
+    assert diagnostic_value("CHECKING_PLAYBACK") == "CHECKING_PLAYBACK"
+    assert diagnostic_value("ck_privatecredential") == "<REDACTED>"
+
+def test_custom_mcp_authorization_links_are_not_recorded(tmp_path):
+    pytest.importorskip("pipecat.observers.function_call_observer")
+    from pipecat.frames.frames import FunctionCallInProgressFrame, FunctionCallResultFrame
+    from pipecat.observers.base_observer import FramePushed
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+    async def scenario():
+        trace = VoiceTrace(tmp_path)
+        observers = trace_observers(trace)
+        source, destination = FrameProcessor(), FrameProcessor()
+        for name in ("connect_mcp", "verify_connection", "reconnect_connection"):
+            args = {"alias": "research", "url": "https://research.example/mcp"}
+            for frame in (
+                FunctionCallInProgressFrame(name, name, args),
+                FunctionCallResultFrame(
+                    name,
+                    name,
+                    args,
+                    result=json.dumps(
+                        {
+                            "status": "awaiting_authorization",
+                            "authorization_url": "https://auth.example/PRIVATE-LINK",
+                        }
+                    ),
+                ),
+            ):
+                for observer in observers:
+                    await observer.on_push_frame(
+                        FramePushed(source, destination, frame, FrameDirection.DOWNSTREAM, 0)
+                    )
+        await asyncio.sleep(0)
+        assert "PRIVATE-LINK" not in trace.path.read_text()
+        assert any(row["event"] == "function_call_completed" for row in entries(trace))
+
+    asyncio.run(scenario())

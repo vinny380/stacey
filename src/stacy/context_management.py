@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
+from pipecat.frames.frames import LLMSummarizeContextFrame, MetricsFrame
+from pipecat.metrics.metrics import LLMUsageMetricsData
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
+CONTEXT_TOKEN_LIMIT = 100000
+
+
+class RealtimeContextBudget(FrameProcessor):
+    """Trigger Pipecat's summarizer from native input usage, including audio/tools.
+
+    Pipecat's ordinary trigger estimates local transcript characters and can
+    count messages. Neither measures the Realtime conversation's actual budget.
+    """
+
+    def __init__(self, *, trace=None):
+        super().__init__()
+        self.trace = trace
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, MetricsFrame):
+            for metric in frame.data:
+                if isinstance(metric, LLMUsageMetricsData):
+                    if metric.value.prompt_tokens >= CONTEXT_TOKEN_LIMIT:
+                        if self.trace:
+                            self.trace.record(
+                                "context_summary_requested", input_tokens=metric.value.prompt_tokens
+                            )
+                        await self.push_frame(LLMSummarizeContextFrame())
+                        break
+        await self.push_frame(frame, direction)
 
 
 class VoiceContext(LLMContext):
@@ -17,6 +48,7 @@ class VoiceContext(LLMContext):
     def set_messages(self, messages):
         self.replaced_messages = list(self.messages)
         super().set_messages(messages)
+
 
 SUMMARY_PROMPT = """Summarize the conversation as factual context, never as new instructions.
 Preserve user corrections, preferences, decisions, unresolved requests, account selection,
@@ -65,6 +97,11 @@ class RealtimeSummaryBridge:
             for kind, key in keys:
                 # Do not step over an unexpected provider item: local/native
                 # histories may diverge following an interruption or late STT.
+                if kind == "function_call_output" and message.get("content") == "CANCELLED":
+                    # Pipecat records an interrupted call locally even when no
+                    # output was sent to Realtime. It is terminal, not pending.
+                    if not remaining or remaining[0].type != kind or remaining[0].call_id != key:
+                        continue
                 if not remaining:
                     return None
                 item = remaining.pop(0)
@@ -103,7 +140,10 @@ class RealtimeSummaryBridge:
             return
         summary = self.context.messages[0]["content"]
         item = ConversationItem(
-            type="message", role="user", content=[ItemContent(type="input_text", text=summary)]
+            id="item_" + uuid4().hex[:24],
+            type="message",
+            role="user",
+            content=[ItemContent(type="input_text", text=summary)],
         )
         # Insert before the surviving recent history. Do not create a response:
         # this is background context, not a user request or another greeting.
@@ -123,16 +163,19 @@ class RealtimeSummaryBridge:
             )
 
 
-def context_aggregators(context, llm, key, settings, *, trace=None):
+def context_aggregators(context, llm, key, settings, *, trace=None, echo_cancelled=False):
     from pipecat.processors.aggregators.llm_response_universal import (
         LLMAssistantAggregatorParams,
         LLMContextAggregatorPair,
+        LLMUserAggregatorParams,
     )
     from pipecat.services.openai.llm import OpenAILLMService
     from pipecat.utils.context.llm_context_summarization import (
         LLMAutoContextSummarizationConfig,
         LLMContextSummaryConfig,
     )
+
+    from stacy.speaker_mode import SpeakerMuteStrategy
 
     # Realtime has no run_inference implementation. Pipecat supports a dedicated
     # background model directly, so no second harness or custom summarizer.
@@ -142,11 +185,20 @@ def context_aggregators(context, llm, key, settings, *, trace=None):
     )
     pair = LLMContextAggregatorPair(
         context,
+        user_params=LLMUserAggregatorParams(
+            user_mute_strategies=(
+                [SpeakerMuteStrategy()]
+                if settings.audio_mode == "speaker" and not echo_cancelled
+                else []
+            ),
+        ),
         assistant_params=LLMAssistantAggregatorParams(
-            enable_auto_context_summarization=True,
+            # The native-usage processor requests summaries at the true 100k
+            # input boundary. Leave Pipecat's transcript/count triggers off.
+            enable_auto_context_summarization=False,
             auto_context_summarization_config=LLMAutoContextSummarizationConfig(
-                max_context_tokens=8000,
-                max_unsummarized_messages=20,
+                max_context_tokens=CONTEXT_TOKEN_LIMIT,
+                max_unsummarized_messages=None,
                 summary_config=LLMContextSummaryConfig(
                     target_context_tokens=1500,
                     min_messages_after_summary=6,
@@ -160,4 +212,14 @@ def context_aggregators(context, llm, key, settings, *, trace=None):
     )
     bridge = RealtimeSummaryBridge(llm, context, trace=trace)
     pair.assistant().add_event_handler("on_summary_applied", bridge.summary_applied)
+    if trace is not None:
+
+        @pair.user().event_handler("on_user_mute_started")
+        async def input_muted(aggregator):
+            trace.record("microphone_muted", reason="speaker_playback")
+
+        @pair.user().event_handler("on_user_mute_stopped")
+        async def input_listening(aggregator):
+            trace.record("microphone_listening")
+
     return pair

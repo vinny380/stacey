@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,9 +21,33 @@ def create_tools(
     memory: MemoryRepo,
     *,
     mcp_config: Path | None = None,
+    reuse_mcp_sessions: bool = True,
+    prewarm_spotify: bool = False,
 ) -> FastMCP:
     """Use the same application tools for MCP and Pipecat's MCP client."""
-    server = FastMCP("Stacy", instructions="Personal assistant tools and reusable skills")
+    spotify = None
+
+    @asynccontextmanager
+    async def lifespan(host):
+        async def prepare():
+            from stacy.tracing import TextTrace
+
+            trace = TextTrace(alarms.database.parent)
+            with trace.activate(), trace.measure("spotify_preparation"):
+                trace.record("background_preparation_started", workflow="spotify")
+                trace.record("background_preparation_finished", **await spotify.prepare())
+
+        warmup = asyncio.create_task(prepare()) if prewarm_spotify and spotify else None
+        try:
+            yield
+        finally:
+            if warmup:
+                warmup.cancel()
+                await asyncio.gather(warmup, return_exceptions=True)
+
+    server = FastMCP(
+        "Stacy", instructions="Personal assistant tools and reusable skills", lifespan=lifespan
+    )
     gateway = MCPGateway(load_servers(mcp_config))
     gateway.register(server)
     composio_key = os.environ.get("COMPOSIO_API_KEY", "").strip()
@@ -52,6 +78,48 @@ def create_tools(
                 },
                 "instruction": "Verify intended account via provider action=list before confirming",
             }
+
+    if "composio" in gateway.servers:
+        from stacy.composio_context import json_result
+        from stacy.spotify_workflow import SpotifyWorkflow
+
+        async def invoke_spotify(name, arguments):
+            return await gateway.call_tool("composio", name, arguments)
+
+        async def spotify_metadata():
+            found = await gateway.search_tools(
+                "composio",
+                "COMPOSIO_SEARCH_TOOLS COMPOSIO_GET_TOOL_SCHEMAS COMPOSIO_MULTI_EXECUTE_TOOL",
+            )
+            payload = json_result(found) or {}
+            definitions = {t["name"]: t["inputSchema"] for t in payload.get("tools", [])}
+            for name in (
+                "COMPOSIO_SEARCH_TOOLS",
+                "COMPOSIO_GET_TOOL_SCHEMAS",
+                "COMPOSIO_MULTI_EXECUTE_TOOL",
+            ):
+                if name not in definitions:
+                    exact = json_result(await gateway.search_tools("composio", name)) or {}
+                    definitions.update(
+                        {t["name"]: t["inputSchema"] for t in exact.get("tools", [])}
+                    )
+            return definitions
+
+        spotify = SpotifyWorkflow(
+            invoke_spotify,
+            metadata=spotify_metadata,
+            scope=(lambda: gateway.session("composio")) if reuse_mcp_sessions else None,
+        )
+        spotify.register(server)
+
+    from stacy.remote_connections import RemoteConnections
+
+    RemoteConnections(
+        gateway,
+        alarms.database.parent,
+        callback_url=os.environ.get("STACY_MCP_CALLBACK_URL") or None,
+        client_metadata_url=os.environ.get("STACY_MCP_CLIENT_METADATA_URL") or None,
+    ).register(server)
 
     @server.tool
     def current_time() -> dict:

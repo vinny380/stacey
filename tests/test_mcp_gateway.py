@@ -1,9 +1,11 @@
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 
 import pytest
 from fastmcp import Client, FastMCP
+from fastmcp.client.transports import FastMCPTransport
 from fastmcp.server.middleware import Middleware
 
 from stacy.mcp_gateway import MCPGateway, load_servers
@@ -16,6 +18,79 @@ class CountCatalog(Middleware):
     async def on_list_tools(self, context, call_next):
         self.requests += 1
         return await call_next(context)
+
+
+def test_workflow_session_reuses_one_connection_and_closes_it_without_context_leakage():
+    async def scenario():
+        counts = {"opened": 0, "closed": 0}
+
+        class CountTransport(FastMCPTransport):
+            @asynccontextmanager
+            async def connect_session(self, **kwargs):
+                counts["opened"] += 1
+                try:
+                    async with super().connect_session(**kwargs) as session:
+                        yield session
+                finally:
+                    counts["closed"] += 1
+
+        upstream = FastMCP("upstream")
+
+        @upstream.tool
+        def read_value(value: str):
+            return {"value": value}
+
+        gateway = MCPGateway(
+            {"remote": {"description": "test"}}, targets={"remote": CountTransport(upstream)}
+        )
+        async with gateway.session("remote"):
+            first = await gateway.call_tool("remote", "read_value", {"value": "first"})
+            second = await gateway.call_tool("remote", "read_value", {"value": "second"})
+            assert first.structured_content["value"] == "first"
+            assert second.structured_content["value"] == "second"
+            assert counts == {"opened": 1, "closed": 0}
+        assert counts == {"opened": 1, "closed": 1}
+
+        async def isolated(value):
+            async with gateway.session("remote"):
+                await asyncio.sleep(0)
+                result = await gateway.call_tool("remote", "read_value", {"value": value})
+                return result.structured_content
+
+        results = await asyncio.gather(isolated("alpha"), isolated("beta"))
+        assert [r["value"] for r in results] == ["alpha", "beta"]
+        assert counts == {"opened": 3, "closed": 3}
+        with pytest.raises(RuntimeError):
+            async with gateway.session("remote"):
+                raise RuntimeError("cancel workflow")
+        assert counts == {"opened": 4, "closed": 4}
+        await gateway.call_tool("remote", "read_value", {"value": "fresh"})
+        assert counts["opened"] > 4
+        assert counts["closed"] == counts["opened"]
+
+        ready = asyncio.Event()
+
+        async def cancelled():
+            async with gateway.session("remote"):
+                ready.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(cancelled())
+        await ready.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert counts["closed"] == counts["opened"]
+        before = counts["opened"]
+        async with gateway.session("remote"):
+            # ContextVars are inherited by children; each child workflow must still
+            # own a fresh client rather than borrowing its parent's session.
+            results = await asyncio.gather(isolated("child-one"), isolated("child-two"))
+            assert [r["value"] for r in results] == ["child-one", "child-two"]
+            assert counts["opened"] == before + 3
+        assert counts["closed"] == counts["opened"]
+
+    asyncio.run(scenario())
 
 
 def test_startup_is_constant_and_discovery_only_contacts_selected_server():
@@ -412,5 +487,49 @@ def test_exact_tool_discovery_returns_one_full_schema_and_caches_success(monkeyp
             {"name": "list_events", "description": "Events", "inputSchema": schema}
         ]
         assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_text_trace_follows_real_mcp_gateway_and_cache(tmp_path):
+    from stacy.tracing import TextTrace, active_text_trace
+
+    async def scenario():
+        upstream = FastMCP("upstream")
+
+        @upstream.tool
+        def SPOTIFY_PAUSE_PLAYBACK(device_id: str):
+            return {"device_id": device_id, "access_token": "never-log-this"}
+
+        host = FastMCP("host")
+        gateway = MCPGateway(
+            {"spotify": {"description": "Spotify playback"}}, targets={"spotify": upstream}
+        )
+        gateway.register(host)
+        trace = TextTrace(tmp_path)
+        with trace.activate():
+            async with Client(host) as client:
+                for _ in range(2):
+                    await client.call_tool(
+                        "search_mcp_tools", {"server": "spotify", "query": "SPOTIFY_PAUSE_PLAYBACK"}
+                    )
+                await client.call_tool(
+                    "call_mcp_tool",
+                    {
+                        "server": "spotify",
+                        "tool": "SPOTIFY_PAUSE_PLAYBACK",
+                        "arguments": {"device_id": "echo"},
+                    },
+                )
+        assert active_text_trace.get() is None
+        raw = trace.path.read_text()
+        events = [json.loads(line) for line in raw.splitlines()]
+        assert [e["hit"] for e in events if e["event"] == "discovery_cache"] == [False, True]
+        assert any(
+            e["event"] == "mcp_remote_request" and e["tool"] == "SPOTIFY_PAUSE_PLAYBACK"
+            for e in events
+        )
+        assert "never-log-this" not in raw
+        assert "echo" in raw
 
     asyncio.run(scenario())

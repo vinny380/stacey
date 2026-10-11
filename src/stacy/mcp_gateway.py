@@ -9,6 +9,8 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,8 @@ from fastmcp.server import create_proxy
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.tools import ToolResult
 from mcp.types import TextContent
+
+from stacy.tracing import active_text_trace
 
 MAX_RESULTS = 5
 _SEARCH = "_stacy_discover_tools"
@@ -96,9 +100,14 @@ class MCPGateway:
         self.servers = servers
         self._targets = targets or {}
         self._proxies: dict[str, FastMCP] = {}
+        self._backends: dict[str, Client] = {}
+        self._scoped_proxies: ContextVar[dict[str, tuple[asyncio.Task | None, FastMCP]] | None] = (
+            ContextVar(f"stacy_mcp_scope_{id(self)}", default=None)
+        )
         self._factories: dict[str, Callable[[], Awaitable[dict]]] = {}
         self._search_cache: OrderedDict = OrderedDict()
         self.adapters: dict[str, Any] = {}
+        self._versions: dict[str, int] = {}
         self._build_directory()
 
     def _build_directory(self) -> None:
@@ -121,6 +130,28 @@ class MCPGateway:
     ) -> None:
         self.servers[name] = {"description": description}
         self._factories[name] = factory
+        self._build_directory()
+
+    def replace_server(self, name: str, entry: dict, *, target=None) -> None:
+        """Activate a verified connection and invalidate its old discovery/session caches."""
+        self.remove_server(name)
+        self.servers[name] = entry
+        if target is not None:
+            self._targets[name] = target
+        self._build_directory()
+
+    def remove_server(self, name: str) -> None:
+        """Stop advertising/executing a connection without restarting the host."""
+        self._versions[name] = self._versions.get(name, 0) + 1
+        self.servers.pop(name, None)
+        self._targets.pop(name, None)
+        self._factories.pop(name, None)
+        self._proxies.pop(name, None)
+        self._backends.pop(name, None)
+        self.adapters.pop(name, None)
+        for key in list(self._search_cache):
+            if key[0] == name:
+                del self._search_cache[key]
         self._build_directory()
 
     def metadata(self) -> list[dict]:
@@ -177,28 +208,97 @@ class MCPGateway:
             # A regular Client preserves its default of not forwarding Stacy's
             # inbound HTTP credentials to a different upstream server.
             target = Client(target, timeout=55, init_timeout=15)
-            proxy = create_proxy(target, mask_error_details=True, provider_error_strategy="raise")
-            proxy.add_transform(
-                ExactFirstSearch(
-                    max_results=MAX_RESULTS,
-                    search_tool_name=_SEARCH,
-                    call_tool_name=_CALL,
-                )
-            )
-            self._proxies[server] = proxy
+            self._backends[server] = target
+            self._proxies[server] = self._make_proxy(target)
         return self._proxies[server]
+
+    @staticmethod
+    def _make_proxy(target) -> FastMCP:
+        proxy = create_proxy(target, mask_error_details=True, provider_error_strategy="raise")
+        proxy.add_transform(
+            ExactFirstSearch(
+                max_results=MAX_RESULTS,
+                search_tool_name=_SEARCH,
+                call_tool_name=_CALL,
+            )
+        )
+        return proxy
+
+    @asynccontextmanager
+    async def session(self, server: str):
+        """Reuse an isolated upstream connection within one sequential workflow.
+
+        Independent tasks receive independent clients. No inbound credentials are
+        forwarded, and ordinary calls retain their existing reconnect behavior.
+        """
+        current = self._scoped_proxies.get() or {}
+        if server in current and current[server][0] is asyncio.current_task():
+            yield
+            return
+        if server in self._factories and server not in self._proxies:
+            self.servers[server] = await self._factories[server]()
+        self._proxy(server)
+        # A new client owns its session; a connected client passed to create_proxy
+        # is reused by nested proxy calls until this outer context exits.
+        async with self._backends[server].new() as backend:
+            token = self._scoped_proxies.set(
+                {
+                    **current,
+                    server: (asyncio.current_task(), self._make_proxy(backend)),
+                }
+            )
+            trace = active_text_trace.get()
+            if trace:
+                trace.record("mcp_workflow_session", server=server, state="opened")
+            try:
+                yield
+            finally:
+                self._scoped_proxies.reset(token)
+                if trace:
+                    trace.record("mcp_workflow_session", server=server, state="closed")
 
     async def _request(self, server: str, name: str, arguments: dict):
         try:
+            if server not in self.servers:
+                raise ToolError("Error: This MCP server is no longer configured")
             if server in self._factories and server not in self._proxies:
                 entry = await self._factories[server]()
                 self.servers[server] = entry
-            proxy = self._proxy(server)
+            scoped = (self._scoped_proxies.get() or {}).get(server)
+            proxy = scoped[1] if scoped else self._proxy(server)
             # Bound connection/discovery as well as execution. Unknown/failed
             # servers cannot take down the local alarm and memory server.
             async with asyncio.timeout(60):
                 async with Client(proxy, timeout=55, init_timeout=15) as client:
-                    return await client.call_tool(name, arguments, raise_on_error=False)
+                    trace = active_text_trace.get()
+                    if trace is None:
+                        return await client.call_tool(name, arguments, raise_on_error=False)
+                    # Log the real provider operation, including calls expanded by adapters.
+                    selected = arguments.get("name", name)
+                    trace.record(
+                        "mcp_remote_started",
+                        server=server,
+                        tool=selected,
+                        arguments=arguments.get("arguments", arguments),
+                    )
+                    with trace.measure("mcp_remote_request", server=server, tool=selected):
+                        result = await client.call_tool(name, arguments, raise_on_error=False)
+                    trace.record(
+                        "mcp_remote_result",
+                        server=server,
+                        tool=selected,
+                        is_error=bool(result.is_error),
+                        result=(
+                            result.data
+                            if result.data is not None
+                            else {
+                                "content": [
+                                    block.model_dump(mode="json") for block in result.content
+                                ]
+                            }
+                        ),
+                    )
+                    return result
         except ToolError:
             raise
         except Exception:
@@ -212,12 +312,32 @@ class MCPGateway:
     async def search_tools(self, server: str, query: str) -> ToolResult:
         if not query.strip():
             raise ToolError("Error: Use capability keywords to search tools, e.g. calendar events")
+        version = self._versions.get(server, 0)
         key = (server, query.strip().casefold())
         cached = self._search_cache.get(key)
-        if cached and time.monotonic() - cached[0] < 300:
+        trace = active_text_trace.get()
+        hit = bool(cached and time.monotonic() - cached[0] < 300)
+        if trace:
+            trace.record(
+                "discovery_cache",
+                server=server,
+                query=query,
+                hit=hit,
+                age_seconds=time.monotonic() - cached[0] if cached else None,
+            )
+        if hit:
             self._search_cache.move_to_end(key)
             return ToolResult(structured_content={"server": server, "tools": cached[1]})
-        result = await self._request(server, _SEARCH, {"query": query})
+
+        async def discover():
+            return await self._request(server, _SEARCH, {"query": query})
+
+        adapter = self.adapters.get(server)
+        result = (
+            await adapter.discover(discover) if hasattr(adapter, "discover") else await discover()
+        )
+        if self._versions.get(server, 0) != version:
+            raise ToolError("Connection changed during discovery; search the current server again")
         if result.is_error:
             return self._error_result(result.content)
         # A nonempty object keeps Pipecat from treating [] as a failed MCP call.
@@ -296,6 +416,13 @@ class MCPGateway:
         )
 
     def register(self, host: FastMCP) -> None:
+        from stacy.tool_index import TOOL_INDEX_URI, build_tool_index
+
+        @host.resource(TOOL_INDEX_URI)
+        def capability_index() -> dict:
+            """Local configured MCP aliases and capability descriptions; no live account status."""
+            return build_tool_index([], self.metadata())
+
         @host.tool
         async def search_mcp_servers(query: str = "", offset: int = 0) -> dict:
             """Find configured MCP servers by capability or alias (e.g. Gmail, calendar, Slack).
@@ -307,7 +434,7 @@ class MCPGateway:
 
         @host.tool
         async def search_mcp_tools(server: str, query: str) -> ToolResult:
-            """Find tools within an exact server alias from search_mcp_servers.
+            """Find tools within an exact server alias from the context index or search_mcp_servers.
 
             Returns at most five matching tool definitions with their full input schemas.
             Search uses keywords (names, descriptions, parameters). Try other keywords
