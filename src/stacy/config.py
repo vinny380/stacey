@@ -19,6 +19,7 @@ class Settings:
     mcp_config: Path | None = None
     summary_model: str = "gpt-4.1-mini"
     text_model: str = "gpt-6-luna"
+    audio_mode: str = "speaker"
 
     @classmethod
     def load(cls) -> Settings:
@@ -32,6 +33,9 @@ class Settings:
         noise_reduction = os.environ.get("STACY_NOISE_REDUCTION", cls.noise_reduction)
         if noise_reduction not in {"near_field", "far_field"}:
             raise ValueError("STACY_NOISE_REDUCTION must be near_field or far_field")
+        audio_mode = os.environ.get("STACY_AUDIO_MODE", cls.audio_mode)
+        if audio_mode not in {"speaker", "headphones"}:
+            raise ValueError("STACY_AUDIO_MODE must be speaker or headphones")
         mcp_path = os.environ.get("STACY_MCP_CONFIG")
         return cls(
             data_dir=data,
@@ -43,4 +47,5 @@ class Settings:
             mcp_config=Path(mcp_path).expanduser().resolve() if mcp_path else None,
             summary_model=os.environ.get("STACY_SUMMARY_MODEL", cls.summary_model),
             text_model=os.environ.get("STACY_TEXT_MODEL", cls.text_model),
+            audio_mode=audio_mode,
         )

@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -86,11 +89,11 @@ def local_telemetry(trace):
 class VoiceTrace:
     """Local, owner-only conversation/tool traces; no raw audio or system prompts."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, *, prefix: str = "voice"):
         directory = data_dir / "traces"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-        self.path = directory / f"voice-{stamp}-{uuid4().hex[:8]}.jsonl"
+        self.path = directory / f"{prefix}-{stamp}-{uuid4().hex[:8]}.jsonl"
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(fd)
 
@@ -138,7 +141,7 @@ def trace_observers(trace: VoiceTrace) -> list:
     async def tool_event(observer, event):
         fields = event.model_dump(mode="json", exclude_none=True)
         kind = fields.pop("kind")
-        if event.function_name == "send_text":
+        if event.function_name in {"send_text", "connect_mcp"}:
             fields.pop("arguments", None)
         # Account tools must never put credentials into diagnostic files.
         if event.function_name == "call_mcp_tool" and isinstance(event.arguments, dict):
@@ -150,7 +153,16 @@ def trace_observers(trace: VoiceTrace) -> list:
         if (
             event.function_name.startswith("spotify_")
             or account_result
-            or event.function_name in {"recent_texts", "connection_status"}
+            or event.function_name
+            in {
+                "recent_texts",
+                "connection_status",
+                "connect_mcp",
+                "list_connections",
+                "verify_connection",
+                "reconnect_connection",
+                "disconnect_connection",
+            }
         ):
             fields.pop("result", None)
         if kind in {
@@ -240,3 +252,87 @@ def trace_observers(trace: VoiceTrace) -> list:
                     self.first_audio = True
 
     return [calls, errors, SpeechObserver()]
+
+
+active_text_trace: ContextVar[TextTrace | None] = ContextVar("active_text_trace", default=None)
+
+_SECRET_KEY = re.compile(
+    r"secret|token|password|authorization|credential|api.?key|cookie|auth.?url|redirect.?url|headers",
+    re.I,
+)
+_SECRET_TEXT = re.compile(
+    r"(?:Bearer\s+\S+|\b(?:sk-|ck_)[A-Za-z0-9_.-]+|https?://[^\s\"<>]+)", re.I
+)
+
+
+def diagnostic_value(value, *, depth=0):
+    """Bound and redact provider payloads, including JSON embedded in MCP text."""
+    if depth > 10:
+        return "<depth limit>"
+    if isinstance(value, dict):
+        result = {}
+        for key, item in list(value.items())[:60]:
+            result[key] = (
+                "<REDACTED>"
+                if _SECRET_KEY.search(str(key))
+                else diagnostic_value(item, depth=depth + 1)
+            )
+        if len(value) > 60:
+            result["_omitted_fields"] = len(value) - 60
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [diagnostic_value(item, depth=depth + 1) for item in value[:30]]
+        if len(value) > 30:
+            result.append({"_omitted_items": len(value) - 30})
+        return result
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            return diagnostic_value(parsed, depth=depth + 1)
+        for name, secret in os.environ.items():
+            if _SECRET_KEY.search(name) and len(secret) >= 8:
+                value = value.replace(secret, "<REDACTED>")
+        value = _SECRET_TEXT.sub("<REDACTED>", value)
+        return value[:4000] + ("<truncated>" if len(value) > 4000 else "")
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return "<unsupported value>"
+
+
+class TextTrace(VoiceTrace):
+    """Bounded, redacted diagnostics; no prompts, chat transcripts or credentials."""
+
+    def __init__(self, data_dir: Path):
+        super().__init__(data_dir, prefix="text")
+
+    def record(self, event: str, **fields) -> None:
+        super().record(event, **{key: diagnostic_value(value) for key, value in fields.items()})
+
+    @contextmanager
+    def activate(self):
+        token = active_text_trace.set(self)
+        try:
+            yield
+        finally:
+            active_text_trace.reset(token)
+
+    @contextmanager
+    def measure(self, event: str, **fields):
+        started = time.perf_counter()
+        try:
+            yield
+        except BaseException as error:
+            self.record(
+                event,
+                seconds=time.perf_counter() - started,
+                status="failed",
+                error_type=type(error).__name__,
+                http_status=getattr(error, "status_code", None),
+                **fields,
+            )
+            raise
+        else:
+            self.record(event, seconds=time.perf_counter() - started, status="complete", **fields)

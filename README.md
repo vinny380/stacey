@@ -86,11 +86,38 @@ Copy `.env.example` to `.env` and fill in credentials locally. The example defin
 uv run --all-extras stacy start
 ```
 
-`start` launches the local service and the Pipecat microphone/speaker pipeline, or attaches voice if a Stacy backend is already running. It requires `OPENAI_API_KEY` for live voice. `serve` runs tools and alarms alone; `voice` attaches a voice session to an already running service. An existing backend is verified before constructing another scheduler. If voice fails, the local service keeps running. Begin audio testing with headphones: speaker echo cancellation and the eventual Pi microphone/speaker arrangement still need hardware testing.
+`start` launches the local service and the Pipecat microphone/speaker pipeline, or attaches voice if a Stacy backend is already running. It requires `OPENAI_API_KEY` for live voice. `serve` runs tools and alarms alone; `voice` attaches a voice session to an already running service. An existing backend is verified before constructing another scheduler. If voice fails, the local service keeps running.
+
+The local MCP HTTP endpoint is stateless: an idle voice client can keep using its tools
+after the backend restarts, without retaining an invalid transport session. Application
+state remains in its existing stores. Commands interrupted during a restart remain
+unconfirmed and are not automatically replayed.
 
 `OPENAI_API_KEY` must be a direct OpenAI API key. Voice uses OpenAI Realtime (`STACY_REALTIME_MODEL=gpt-realtime-2.1`, `STACY_VOICE=marin`) with native turn detection and 24 kHz audio. Pipecat handles the conversation and MCP tools; separate transcription and speech-generation services are not required.
 
-If Stacy cuts herself off while you are silent, try headphones and check macOS Sound settings for the intended input/output devices before restarting. The local PyAudio transport does not provide acoustic echo cancellation: speaker audio can be mistaken for an interruption. [OpenAI input noise reduction](https://developers.openai.com/api/reference/resources/realtime/client-events) is enabled with `STACY_NOISE_REDUCTION=far_field` for laptop/room microphones; use `near_field` for a headset microphone. This filtering is not an echo-cancellation fix. Natural interruptions remain enabled.
+Audio defaults to speaker mode (`STACY_AUDIO_MODE=speaker`). On macOS, Stacy uses one
+native `AVAudioEngine` for capture and playback with Apple's echo cancellation enabled.
+The microphone stays open while she speaks, so you can interrupt. Pipecat's normal
+Realtime speech detection stops the reply and clears speech queued on the audio device;
+capture keeps running and the next reply can play. Work sounds use the same render path.
+The internal helper is compiled and cached automatically using Apple's command line tools.
+It saves no microphone recordings and needs no browser or companion app.
+
+If native audio cannot initialize, Stacy reports the fallback and uses
+[Pipecat's user mute strategy](https://docs.pipecat.ai/api-reference/server/utilities/turn-management/user-mute-strategies)
+during playback plus a 350 ms echo tail. This fallback also applies to Linux/Pi until a
+verified echo-cancelling capture/render pair is wired. In fallback mode, let her finish
+before speaking. A device change that invalidates active native audio stops the voice
+session rather than forwarding unprocessed microphone audio.
+
+For development with headphones, `STACY_AUDIO_MODE=headphones` retains simultaneous
+listening and natural interruptions. The local PyAudio transport does not provide acoustic
+echo cancellation. [OpenAI input noise reduction](https://developers.openai.com/api/reference/resources/realtime/client-events)
+is enabled with `STACY_NOISE_REDUCTION=far_field` for room microphones; `near_field` is
+intended for headsets. That filtering does not replace echo cancellation. See Apple's
+[voice-processing APIs](https://developer.apple.com/videos/play/wwdc2019/510/) and
+[PipeWire's echo-cancel module](https://docs.pipewire.org/page_module_echo_cancel.html)
+for the Mac and Pi audio paths.
 
 Normal voice logging uses INFO. Set `STACY_LOG_LEVEL=DEBUG` for detailed diagnostics, including prompts and loaded personal memory. Pipecat's "realtime mode — mutated turn strategies" warning describes an automatic SDK adjustment; it does not indicate failed startup.
 
@@ -100,11 +127,73 @@ Each voice session prints and saves an owner-only JSONL log in `$STACY_DATA_DIR/
 
 [Pipecat OpenTelemetry](https://docs.pipecat.ai/api-reference/server/utilities/opentelemetry) is enabled with metrics and turn tracking. Its SDK exporter saves a second local `otel-*.jsonl` file; an attribute allowlist excludes raw prompts, messages, URLs and exception details. No collector is needed. Negative SDK duration values are excluded, and voice logs separately measure user-turn-end to first/subsequent response audio. Set `STACY_OTEL_ENABLED=false` to disable spans. Conversation/tool logs remain enabled for debugging. Existing historical trace files are not rewritten.
 
-Voice uses Pipecat's [shared context and aggregators](https://docs.pipecat.ai/pipecat/learn/context-management), with the assistant aggregator after speaker output. Personality and startup memory stay in `system_instruction` outside the compressible conversation. [Native automatic summarization](https://docs.pipecat.ai/pipecat/fundamentals/context-summarization) triggers at approximately 8,000 conversation tokens or 20 new messages. A dedicated `gpt-4.1-mini` background service generates a summary of up to 1,500 tokens; six recent messages and incomplete tool-call sequences stay intact. `STACY_SUMMARY_MODEL` overrides that background model.
+Voice uses Pipecat's [shared context and aggregators](https://docs.pipecat.ai/pipecat/learn/context-management), with the assistant aggregator after speaker output. Personality and startup memory stay in `system_instruction` outside the compressible conversation. Realtime's reported input usage requests [Pipecat summarization](https://docs.pipecat.ai/pipecat/fundamentals/context-summarization#on-demand-summarization) at **100,000 tokens**, including audio, instructions and tools. Transcript estimates and message-count triggers are disabled. A dedicated `gpt-4.1-mini` background service generates a summary of up to 1,500 tokens; six recent messages and incomplete tool-call sequences stay intact. `STACY_SUMMARY_MODEL` overrides that background model. The Realtime session disables automatic history truncation and caps each response at 4,096 tokens; a local text-only server test retained 105,217 input tokens with these settings.
 
 The installed Realtime adapter keeps a separate server-side history. A small bridge mirrors Pipecat's summarized prefix with typed Realtime create/delete events without requesting another response. It matches message roles and tool-call IDs, retains recent/pending work, and restores local history if the prefix cannot be matched safely. Such a mismatch logs `context_summary_sync_skipped`; it does not count as successful compaction. Pipecat's [Flows context strategies](https://docs.pipecat.ai/pipecat/flows/context-strategies) apply to node transitions; this open-ended assistant does not currently use Flows or the deprecated `RESET_WITH_SUMMARY` strategy.
 
 A quiet typing loop plays through Pipecat's audio mixer after 650 ms of silent processing. It stops during user/assistant speech, after a completed answer, on interruption, and at shutdown. It never enters speech context or alters non-silent speech PCM. Set `STACY_WORK_SOUND=off` to disable it. Physical speaker/microphone behavior still needs listening tests.
+
+Text requests save owner-only `text-*.jsonl` diagnostic traces in `$STACY_DATA_DIR/traces`.
+Version 2 traces record queue/context/model/tool timing, model request IDs and output types,
+token usage (including reasoning/cache tokens), tool call IDs, redacted arguments/results,
+underlying MCP operations (including adapter-expanded calls), and discovery cache hits.
+Payloads are bounded; omitted items and truncated strings are marked. Credential fields,
+configured environment secrets and HTTP links are redacted, including embedded JSON.
+Chat transcripts, system prompts and private memory tool payloads are omitted.
+A hashed message reference correlates backend traces with the iMessage adapter's JSON
+lifecycle logs: receipt, queue wait, backend wait, and provider send acknowledgement.
+Acknowledgement does not prove delivery to the phone. Existing traces are not rewritten.
+
+Text conversations retain a bounded operational working context from completed tool
+exchanges, separate from personal memory. The latest three tool-bearing turns are eligible
+for 15 minutes, within a 48,000-character budget. Complete exchanges are dropped when too
+large; schemas are never cut in half. This gives follow-ups access to discovered schemas,
+provider sessions and resolved targets without replaying actions. Authentication, private
+memory and messaging payloads are omitted; credentials and HTTP links are redacted.
+Historical playback/account status still requires fresh verification. Uncertain turns clear
+this working context. A developer benchmark compares the production text loop against
+simulated Spotify tools: `python scripts/check_text_harness.py --repeats 2`. It uses normal
+model API credits and makes no real Spotify calls or iMessage sends.
+The `--experiment routing` evaluation advertises both Composio and a separate Soloist
+player. Its checks reject wrong-player calls, missing schemas, duplicate writes and
+verification in the same parallel batch as the write. Music follow-ups keep the preceding
+device/account/integration; instructions require complete app schemas and explicit device
+IDs on controls that support them. These instructions are evaluated behavior, not a
+general deterministic routing or schema-validation guarantee for every provider.
+
+Composio Spotify exposes four shared workflow tools: play a genre/mood playlist in one call,
+find music/device choices, control playback with verification, and read playback.
+Open music requests use Spotify's top ranked matching playlist; exact track/album requests
+keep the find/choose/control path. The harness resolves current schemas and an
+explicit active account internally, caches capabilities for five minutes, and returns compact
+results. Controls include play/resume, pause, next and previous. A control targets the supplied device, executes once, and then awaits a separate fresh
+state read. Verification checks account, device, requested state and music URI when supplied.
+Ambiguous accounts/devices, expired or missing schemas, and uncertain outcomes never count as
+verified success. Text-turn retries of the same workflow mutation return the original result.
+Skip reads the current device/track before the command and verifies a changed track afterward.
+Each workflow holds its own upstream MCP connection until it completes; concurrent workflows
+use separate connections. Generic discovery and conversational connection setup remain available.
+The backend prepares the small Spotify schema/account registry in a cancellable read-only
+startup task. It does not block local tools, play music, initiate authorization or extend
+the five-minute evidence lifetime. An expired registry is refreshed on demand.
+
+Text and voice context include a bounded local capability index: advertised direct tool names
+and configured MCP aliases with short descriptions. Native callable schemas retain their full
+constraints; remote catalogs stay behind lazy discovery. A listed server can be searched directly,
+skipping server discovery. Text refreshes this index each turn; voice receives a startup snapshot
+and can discover connections added during the session. Index metadata does not establish active
+accounts or current device/playback state, and secret values/authorization URLs are redacted.
+
+The developer hill-climbing runner is `python -m scripts.autoresearch_harness --repeats 3`.
+It tests the production text loop with Luna and simulated providers, alternates paired order,
+runs regression gates, and saves feature/source fingerprints, grades and redacted traces in
+`.scratch/harness-optimization/autoresearch-*`. Faster invalid trials are rejected. It recommends
+features without editing production settings. These model runs use API credits and do not make
+real Spotify calls or send messages. Real-provider latency needs separate live validation.
+Additional comparisons use `--incumbent-workflow --features index playlist`. The separate
+`python -m scripts.check_capability_index --output <new-experiment-directory>` measures a
+discovery-heavy fixture request without a direct workflow. Playback rows record time to command
+acknowledgment separately from verified reply time.
 
 iMessage uses the separate Responses API text agent with `STACY_TEXT_MODEL=gpt-6-luna`. Voice stays on `gpt-realtime-2.1`. Discovery schemas are cached for five minutes, exact-name lookups return one tool, and Composio search returns at most five relevant full schemas plus names for additional matches. Input constraints, prerequisite plans, pagination guidance and provider errors remain available.
 
@@ -197,6 +286,87 @@ selected tool and arguments. Configured server credentials do not enter discover
 This bounds advertised tool schemas; ordinary conversation and returned document content
 still consume context. It doesn't implement conversation compaction.
 
+### Conversational custom remote connections
+
+The shared voice/text tools now include `connect_mcp`, `list_connections`,
+`verify_connection`, `reconnect_connection` and `disconnect_connection`. A user can
+provide a public HTTPS MCP endpoint and a distinct friendly alias in conversation.
+Stacy initializes it and lists its tools before activating it in the running gateway.
+This is a protocol/catalog check, not proof every upstream action succeeds. At least one
+tool must be discoverable. No config-file edit or assistant restart is needed.
+
+OAuth connections return a provider authorization link. During voice, Stacy uses the
+existing `send_text` iMessage tool; in chat she includes the link. The phone callback
+records consent, then the user's spoken/texted "done" triggers `verify_connection` for
+the intended alias. Multiple pending setups require explicit selection. PKCE, state,
+registration and callback results survive a process restart. A pending link is reused
+for ten minutes; expired grants are renewed during verification. Reconnect explicitly
+starts fresh authorization. Tokens refresh through the MCP SDK when supported.
+
+**Deployment prerequisite:** set `STACY_MCP_CALLBACK_URL` to a stable public HTTPS URL
+ending in `/connections/oauth/callback`, with that route forwarded to Stacy's local
+process. This is an operational deployment setting, not a user onboarding task. Expose
+only OAuth routes; `/mcp` and `/agent/message` must remain private. Disable or redact
+callback query logging in the public proxy. The local server disables access logging,
+and authorization tool results/SDK exception details are omitted from diagnostics.
+Stacy never opens a host browser or offers a localhost callback. Without a provisioned
+callback, public unauthenticated MCPs work, while authenticated connections report that
+phone authorization is unavailable on this installation.
+
+For providers supporting OAuth client metadata documents (CIMD), deployments may set
+`STACY_MCP_CLIENT_METADATA_URL` to an HTTPS JSON metadata document under their control;
+the MCP SDK uses it as the verified client identity instead of dynamic registration.
+Providers may restrict dynamic registration even when they advertise a registration
+endpoint. Discovery metadata alone does not prove an arbitrary client can register.
+When that URL ends in `/connections/oauth/client.json` on the callback's origin, Stacy
+serves the metadata document herself; it contains only client identity and callback
+information. `RemoteConnections.oauth_app()` provides a separate ingress containing
+only the callback and this metadata route, suitable for a constrained HTTPS proxy.
+
+The Stanley connection was tested locally against `https://xapi.getstanley.ai/mcp`:
+Stacy generated its `/mcp/consent` OAuth request using CIMD and PKCE, sent it through the
+existing iMessage bridge, received the phone callback, exchanged the authorization code,
+and verified both remote tools. A new local process reused the stored grant without
+another consent and discovered `message_stanley` and `check_stanley_reply` through the
+shared gateway. That initial catalog test executed no Stanley actions. The test used a temporary HTTPS tunnel
+to the narrow local ingress, with access logging disabled; no application was deployed.
+A temporary tunnel hostname is a developer test fixture, not a durable Pi client identity.
+
+Headless bearer credentials can be imported through the internal
+`RemoteConnections.import_bearer` interface by a trusted credential-entry adapter.
+It is deliberately absent from model tools, stores the credential only in the private
+credential file, and verifies discovery before activating access. A user-facing secure
+credential-entry adapter is not implemented yet; do not ask for tokens in chat/voice.
+Explicit local developer tests can opt into a loopback callback via the constructor's
+`local_callback_test` option. Production configuration still requires public HTTPS.
+
+`remote-connections.json` stores aliases, endpoints and cached status under the data
+directory. `remote-credentials.json` separately stores OAuth registration, pending grants
+and tokens; both files use owner-only permissions and atomic replacement. Neither is
+personal memory. Disconnect removes local credentials and gateway access; it does not
+revoke the provider's authorization grant. Request failures do not repeat upstream writes.
+A one-time authorization code is never retried after an uncertain token exchange; use
+an explicit reconnect to recover.
+
+This flow supports public HTTPS Streamable HTTP MCPs and OAuth providers supporting
+public-client dynamic registration. Embedded credentials, URL query/fragment credentials,
+private-network endpoints, API-key entry and subprocess installation are excluded.
+Claude/Grok model delegation and existing chats/projects require their own integrations.
+Developer-configured MCPs and Composio accounts retain their existing management paths.
+
+Validation includes HTTP protocol/PKCE/restart/refresh tests, a fixture handoff through
+the existing iMessage bridge into a text-agent completion turn, and a live public DeepWiki
+connection, discovery, documentation read and disconnection check. Stanley's actual OAuth
+callback and code exchange were verified locally. The approved grant was then moved into
+the regular local assistant's operational store; that same iMessage backend called Stanley,
+received "Stacey, we are connected.", and sent the result through the existing bridge.
+Provider acceptance confirms the text send. Stable Pi callback/identity provisioning
+remains deployment work.
+The production voice pipeline also verified a Stanley reply and Frank Sinatra playback
+on the owner's Echo Show 5 after fixing the local transport's invalid session after restart.
+The [backend restart regression](tests/test_voice_backend_restart.py) verifies tool use
+after an idle backend restart.
+
 ### Composio account connections
 
 Set `COMPOSIO_API_KEY` to the `ck_` consumer key from **For You → Sessions & API Key**.
@@ -242,6 +412,14 @@ Follow the [upstream format](https://github.com/AgentMemoryRepo/agentmemoryrepo/
 ## Reuse and integration
 
 Use Pipecat for conversation context and asynchronous tool execution. Use FastMCP's existing `SkillsDirectoryProvider` and `ResourcesAsTools` transform to make skill instructions discoverable and readable. Expose narrowly scoped file, search, and Git tools for the configured memory repository.
+
+Voice and text share a bounded skill catalog containing names, descriptions and resource URIs.
+Calendar, tasks, Spotify and connected-app workflows live under `src/stacy/skills`; only the
+selected recipe is loaded through `read_resource`. Calendar instructions use complete local
+day boundaries and an explicit Google account. Task instructions resolve the user's intended
+service/list before creating a task. Recipes reuse complete schemas, sessions and account/device
+choices on continuations. Provider schemas stay in the existing bounded Spotify cache or retained
+working context; skill instructions do not replace live discovery or result verification.
 
 The upstream skill is invoked explicitly and does not install automatic startup hooks or scheduled maintenance. Stacy supplies the application wiring:
 
@@ -331,4 +509,18 @@ The offline tests use local temporary storage and mocked provider responses; the
 
 The live memory check passed with generated PCM input: naturally mentioned music and communication preferences were saved and committed, fresh sessions retrieved linked notes, a correction replaced the music preference, and another fresh session recalled the correction while preserving the communication preference. An empty literal search returned a valid no-matches result. Final check traces had no tool or pipeline errors. One retrieval turn still included a spoken preamble; single acknowledgements were observed for the preference and correction turns.
 
-Test alarms were cancelled and temporary operational/memory storage removed; diagnostic traces remain under `.cache/traces`. Everyday memory quality and microphone/speaker echo still need observation during real conversations. Web API Spotify playback and E2B execution remain unverified. The MVP does not include wake-word detection, desktop GUI control or a boot-time service yet.
+The speaker fallback regression replays output PCM into microphone capture and verifies
+suppression during playback and the echo tail. Echo-cancelled and headphone paths keep
+simultaneous listening. A production-pipeline interruption test uses the real Realtime
+speech-start handler to verify that queued device audio is cleared, capture continues,
+stale playback callbacks are ignored and the next reply plays.
+
+A bounded physical Mac check compared the same speaker phrase with processing disabled
+and enabled: average microphone pickup fell from RMS 571 to 10 after warmup, about 35 dB.
+The production native transport then captured 515 frames during playback, acknowledged
+queue clearing in 1.8 ms, continued capture and played a fresh reply. This measures the
+native clear operation, not total speech-detection latency. These checks saved only
+aggregate metrics and made no provider calls. Human double-talk at different volumes
+and the Pi audio hardware still need live validation.
+
+Test alarms were cancelled and temporary operational/memory storage removed; diagnostic traces remain under `.cache/traces`. Everyday memory quality still needs observation during real conversations. Web API Spotify playback and E2B execution remain unverified. The MVP does not include wake-word detection, desktop GUI control or a boot-time service yet.

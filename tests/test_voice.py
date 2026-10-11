@@ -50,14 +50,18 @@ def test_realtime_pipeline_keeps_memory_tools_and_native_turn_detection(tmp_path
         "offline-test",
         tools,
         SimpleNamespace(input=lambda: incoming, output=lambda: outgoing),
+        tool_index={"servers": [{"server": "calendar", "does": "Work calendars"}]},
     )
     llms = [p for p in pipeline.processors if isinstance(p, OpenAIRealtimeLLMService)]
     assert len(llms) == 1
     llm = llms[0]
     assert llm.base_url == "wss://api.openai.com/v1/realtime?model=" + settings.realtime_model
     assert "Likes jazz" in llm.settings.system_instruction
+    assert "Work calendars" in llm.settings.system_instruction
     assert llm.settings.session_properties.audio.input.turn_detection.type == "semantic_vad"
     session = llm.settings.session_properties.model_dump(exclude_none=True)
+    assert session["truncation"] == "disabled"
+    assert session["max_output_tokens"] == 4096
     assert session["audio"]["input"]["noise_reduction"] == {"type": noise_reduction}
     assert llm.settings.session_properties.audio.output.voice == "marin"
     assert llm._functions["set_timer"].cancel_on_interruption is True
@@ -68,6 +72,27 @@ def test_invalid_microphone_noise_reduction_fails_early(monkeypatch):
     monkeypatch.setenv("STACY_NOISE_REDUCTION", "typo")
     with pytest.raises(ValueError, match="STACY_NOISE_REDUCTION"):
         Settings.load()
+
+
+def test_actual_outgoing_session_update_keeps_context_budget_fields(tmp_path, monkeypatch):
+    import asyncio
+
+    from stacy.voice import create_realtime_service
+
+    async def scenario():
+        llm = create_realtime_service(Settings(tmp_path, tmp_path / "memory"), "offline")
+        sent = []
+
+        async def send(value):
+            sent.append(value)
+
+        monkeypatch.setattr(llm, "_ws_send", send)
+        await llm._send_session_update()
+        assert sent[0]["type"] == "session.update"
+        assert sent[0]["session"]["truncation"] == "disabled"
+        assert sent[0]["session"]["max_output_tokens"] == 4096
+
+    asyncio.run(scenario())
 
 
 def test_production_worker_sends_initial_tool_context_before_audio(tmp_path, monkeypatch):

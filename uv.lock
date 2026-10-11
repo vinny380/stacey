@@ -2478,6 +2478,9 @@ source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
     { name = "fastmcp" },
+    { name = "jsonschema" },
+
+    { name = "mcp" },
     { name = "python-dotenv" },
     { name = "uvicorn" },
 ]
@@ -2511,6 +2514,9 @@ requires-dist = [
     { name = "exa-py", marker = "extra == 'integrations'" },
     { name = "fastmcp", specifier = ">=4.1,<5" },
     { name = "httpx", marker = "extra == 'integrations'" },
+    { name = "jsonschema", specifier = ">=4.26,<5" },
+
+    { name = "mcp", specifier = ">=2.3,<3" },
     { name = "openai", marker = "extra == 'messaging'", specifier = ">=2,<4" },
     { name = "pipecat-ai", extras = ["local", "openai", "mcp", "tracing"], marker = "extra == 'voice'", specifier = ">=1,<2" },
     { name = "python-dotenv", specifier = ">=1,<2" },

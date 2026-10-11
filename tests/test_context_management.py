@@ -13,7 +13,7 @@ from pipecat.utils.context.llm_context_summarization import (
 )
 
 from stacy.config import Settings
-from stacy.context_management import RealtimeSummaryBridge, VoiceContext
+from stacy.context_management import RealtimeContextBudget, RealtimeSummaryBridge, VoiceContext
 from stacy.voice import build_voice_pipeline
 
 
@@ -26,6 +26,72 @@ class LLM:
 
     async def send_client_event(self, event):
         self.sent.append(event.model_dump(exclude_none=True))
+
+
+def test_native_token_budget_waits_for_100k_and_does_not_accumulate_usage(monkeypatch):
+    from pipecat.frames.frames import LLMSummarizeContextFrame, MetricsFrame
+    from pipecat.metrics.metrics import LLMTokenUsage, LLMUsageMetricsData
+    from pipecat.processors.frame_processor import FrameDirection
+
+    async def scenario():
+        budget, sent = RealtimeContextBudget(), []
+
+        async def pushed(frame, direction=FrameDirection.DOWNSTREAM):
+            sent.append(frame)
+
+        monkeypatch.setattr(budget, "push_frame", pushed)
+        for tokens in [8000, 99999, 99999]:
+            await budget.process_frame(
+                MetricsFrame(
+                    data=[
+                        LLMUsageMetricsData(
+                            processor="Realtime",
+                            value=LLMTokenUsage(
+                                prompt_tokens=tokens, completion_tokens=10, total_tokens=tokens + 10
+                            ),
+                        )
+                    ]
+                ),
+                FrameDirection.DOWNSTREAM,
+            )
+        assert not any(isinstance(frame, LLMSummarizeContextFrame) for frame in sent)
+        await budget.process_frame(
+            MetricsFrame(
+                data=[
+                    LLMUsageMetricsData(
+                        processor="Realtime",
+                        value=LLMTokenUsage(
+                            prompt_tokens=100000, completion_tokens=10, total_tokens=100010
+                        ),
+                    )
+                ]
+            ),
+            FrameDirection.DOWNSTREAM,
+        )
+        assert sum(isinstance(frame, LLMSummarizeContextFrame) for frame in sent) == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_output_missing_from_provider_does_not_block_safe_prefix():
+    async def scenario():
+        context, llm = VoiceContext(), LLM()
+        bridge = RealtimeSummaryBridge(llm, context)
+        items = [
+            ConversationItem(id="f1", type="function_call", call_id="cancelled", name="read"),
+            ConversationItem(id="u1", type="message", role="user"),
+        ]
+        for item in items:
+            await bridge.item_changed(llm, item.id, item)
+        assert bridge.prefix_ids(
+            [
+                {"role": "assistant", "tool_calls": [{"id": "cancelled"}]},
+                {"role": "tool", "tool_call_id": "cancelled", "content": "CANCELLED"},
+                {"role": "user", "content": "Try again"},
+            ]
+        ) == ["f1", "u1"]
+
+    asyncio.run(scenario())
 
 
 def test_native_summary_preserves_recent_and_pending_calls_and_mirrors_provider():
@@ -116,12 +182,17 @@ def test_voice_uses_native_background_summarization_and_persistent_instructions(
     )
     assistant = next(p for p in pipeline.processors if isinstance(p, LLMAssistantAggregator))
     summarizer = assistant._summarizer
-    assert summarizer._auto_trigger
+    assert not summarizer._auto_trigger
     config = summarizer._auto_config
-    assert config.max_context_tokens == 8000
-    assert config.max_unsummarized_messages == 20
+    assert config.max_context_tokens == 100000
+    assert config.max_unsummarized_messages is None
     assert config.summary_config.min_messages_after_summary == 6
     assert config.summary_config.llm.settings.model == "gpt-4.1-mini"
     llm = next(p for p in pipeline.processors if isinstance(p, OpenAIRealtimeLLMService))
     assert "You are Stacy" in llm.settings.system_instruction
     assert not assistant.context.messages
+
+    # Long conversations below 100k must not trigger just because they have
+    # many messages; the old 20-message trigger compacted after a few minutes.
+    assistant.context.set_messages([{"role": "user", "content": "hello"}] * 100)
+    assert summarizer._should_summarize() is False

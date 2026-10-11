@@ -35,6 +35,9 @@ def test_consumer_connection_is_lazy_and_keeps_credentials_out_of_discovery():
             assert "ck_private" not in str(result)
             assert "headers" not in str(result)
             assert gateway._proxies == {}
+            spotify = await client.call_tool("search_mcp_servers", {"query": "Spotify playback"})
+            assert spotify.data["servers"][0]["server"] == "composio"
+            assert gateway._proxies == {}
 
     asyncio.run(scenario())
 
@@ -61,6 +64,7 @@ def test_text_link_and_completion_use_native_mcp_over_consumer_authenticated_htt
             self.requests = []
             self.steps = iter(
                 [
+                    ("read_resource", {"uri": "skill://connected-apps/SKILL.md"}),
                     ("search_mcp_servers", {"query": "Google calendar"}),
                     ("search_mcp_tools", {"server": "composio", "query": "COMPOSIO_SEARCH_TOOLS"}),
                     (
@@ -131,7 +135,13 @@ def test_text_link_and_completion_use_native_mcp_over_consumer_authenticated_htt
             self.requests.append(kwargs)
             step = next(self.steps)
             assert "ck_fixture-key" not in json.dumps(kwargs)
-            assert "action='list'" in kwargs["instructions"]
+            if isinstance(step, tuple) and step[0] == "read_resource":
+                assert "skill://connected-apps/SKILL.md" in kwargs["instructions"]
+                assert "action='list'" not in kwargs["instructions"]
+            else:
+                # The provider recipe comes from the on-demand skill result,
+                # then survives the done follow-up in retained working context.
+                assert "action='list'" in json.dumps(kwargs["input"])
             if isinstance(step, tuple):
                 name, arguments = step
                 return SimpleNamespace(
