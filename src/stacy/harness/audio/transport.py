@@ -42,12 +42,14 @@ async def open_audio_transport(
             finally:
                 await native.close()
             return
-    yield AudioSession(
-        LocalAudioTransport(
-            LocalAudioTransportParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_out_mixer=feedback,
-            )
-        )
+    params = LocalAudioTransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_out_mixer=feedback,
     )
+    transport_type = LocalAudioTransport
+    if sys.platform == "linux":
+        from stacy.harness.audio.linux import LinuxAudioTransport
+
+        transport_type = LinuxAudioTransport
+    yield AudioSession(transport_type(params))
