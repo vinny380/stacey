@@ -113,6 +113,77 @@ def test_failed_turn_is_not_reexecuted(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("cache_prompt", [False, True])
+@pytest.mark.parametrize("final_tool_call", [False, True])
+def test_tool_limit_finishes_without_repeating_work(tmp_path, cache_prompt, final_tool_call):
+    class ExhaustiveSearch(Model):
+        async def create(self, **kwargs):
+            self.requests.append({**kwargs, "input": list(kwargs["input"])})
+            if kwargs.get("tool_choice") == "none" and not final_tool_call:
+                return SimpleNamespace(
+                    id="summary",
+                    usage=None,
+                    output=[Output(type="message", role="assistant", content=[])],
+                    output_text=(
+                        "Checked 30 pages. Reply to the review request. Coverage is incomplete."
+                    ),
+                )
+            page = len(self.requests)
+            return SimpleNamespace(
+                id=f"page-{page}",
+                usage=None,
+                output=[
+                    Output(
+                        type="function_call",
+                        name="read_page",
+                        arguments=json.dumps({"page": page}),
+                        call_id=f"call-{page}",
+                    )
+                ],
+                output_text="",
+            )
+
+    async def scenario():
+        tools = FastMCP("test")
+        pages = []
+
+        @tools.tool
+        def read_page(page: int):
+            pages.append(page)
+            return {"page": page, "needs_reply": "Review request", "has_more": True}
+
+        model = ExhaustiveSearch()
+        agent = TextAgent(
+            Settings(tmp_path, tmp_path / "memory"),
+            tools,
+            model_client=model,
+            cache_prompt=cache_prompt,
+        )
+        message = AgentMessage("imessage", "dm", "owner", "brief", "Summarize pending replies")
+        try:
+            if final_tool_call:
+                with pytest.raises(RuntimeError, match="tools during final summarization"):
+                    await agent.respond(message)
+                with pytest.raises(RuntimeError, match="Earlier attempt"):
+                    await agent.respond(message)
+            else:
+                reply = await agent.respond(message)
+                assert "review request" in reply.lower()
+                assert "incomplete" in reply
+                assert await agent.respond(message) == reply
+            assert pages == list(range(1, 31))
+            final = model.requests[-1]
+            assert final["tool_choice"] == "none"
+            assert len([i for i in final["input"] if i.get("type") == "function_call_output"]) == 30
+            assert final["input"][-1]["role"] == "developer"
+            assert "coverage" in final["input"][-1]["content"].lower()
+            assert len(model.requests) == 31
+        finally:
+            await agent.close()
+
+    asyncio.run(scenario())
+
+
 def test_cacheable_prompt_keeps_dynamic_time_memory_and_source_after_breakpoint(tmp_path):
     from stacy.harness.context import ConversationContext
     from stacy.harness.instructions import instructions

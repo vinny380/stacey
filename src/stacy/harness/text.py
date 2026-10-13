@@ -22,6 +22,8 @@ from stacy.runtime.settings import Settings
 if TYPE_CHECKING:
     from openai.types.responses import Response
 
+MAX_TOOL_ROUNDS = 30
+
 
 class Responses(Protocol):
     async def create(self, **kwargs: Any) -> Response: ...
@@ -175,13 +177,26 @@ class TextAgent:
                 )
                 for t in schemas
             ]
-            for step in range(16):
+            for step in range(MAX_TOOL_ROUNDS + 1):
+                finishing = step == MAX_TOOL_ROUNDS
+                if finishing:
+                    trace.record("tool_budget_reached", rounds=MAX_TOOL_ROUNDS)
+                    context.append(
+                        {
+                            "role": "developer",
+                            "content": "The tool budget for this turn is exhausted. Give the user "
+                            "a final answer using only the verified results already gathered. "
+                            "Clearly state incomplete coverage and any failed or uncertain "
+                            "actions. Do not invent results or claim unverified completion.",
+                        }
+                    )
                 with trace.measure("model_request", step=step, model=self.settings.text_model):
                     response = await self.model_client.responses.create(
                         model=self.settings.text_model,
                         instructions=None if self.cache_prompt else prompt,
                         input=context,
                         tools=functions,
+                        tool_choice="none" if finishing else "auto",
                         store=False,
                         parallel_tool_calls=False,
                     )
@@ -210,6 +225,8 @@ class TextAgent:
                     )
                 context.extend(item.model_dump(exclude_none=True) for item in response.output)
                 calls = [item for item in response.output if item.type == "function_call"]
+                if finishing and calls:
+                    raise RuntimeError("Agent requested tools during final summarization")
                 if not calls:
                     if not response.output_text.strip():
                         raise RuntimeError("Agent returned no reply")
