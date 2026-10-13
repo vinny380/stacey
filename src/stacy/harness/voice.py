@@ -43,6 +43,7 @@ def create_realtime_service(
     *,
     context: ConversationContext,
     memory_source: str = "current conversation",
+    trace: VoiceTrace | None = None,
 ) -> OpenAIRealtimeLLMService:
     from pipecat.services.openai.realtime.events import (
         AudioConfiguration,
@@ -68,10 +69,128 @@ def create_realtime_service(
         session: SerializeAsAny[SessionProperties]
 
     class ContextRealtimeService(OpenAIRealtimeLLMService):
+        def __init__(self, **kwargs):
+            from stacy.harness.voice_activation import InvocationWindow
+
+            super().__init__(**kwargs)
+            self.activation = InvocationWindow()
+            self._invoked = False
+            self._accepted_turn_ready = False
+            self._voice_decisions: dict[str, bool] = {}
+            self._pending_voice_items: dict = {}
+
         async def send_client_event(self, event):
             if isinstance(event, SessionUpdateEvent):
                 event = ContextSessionUpdateEvent(event_id=event.event_id, session=event.session)
             await super().send_client_event(event)
+
+        async def _create_response(self):
+            if self._api_session_ready and not self._invoked:
+                # Bootstrap context/tools without the upstream service's automatic
+                # startup greeting. Keep initial messages in the native conversation.
+                if self._llm_needs_conversation_setup and self._context is not None:
+                    from pipecat.services.openai.realtime.events import ConversationItemCreateEvent
+
+                    params = self.get_llm_adapter().get_llm_invocation_params(self._context)
+                    for item in params["messages"]:
+                        event = ConversationItemCreateEvent(item=item)
+                        self._messages_added_manually[event.item.id] = True
+                        await self.send_client_event(event)
+                    await self._send_session_update()
+                    self._llm_needs_conversation_setup = False
+                return
+            await super()._create_response()
+
+        async def process_frame(self, frame, direction):
+            from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame
+
+            if isinstance(frame, BotStartedSpeakingFrame):
+                self.activation.playback_started()
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.activation.playback_stopped()
+            await super().process_frame(frame, direction)
+
+        async def _handle_evt_speech_started(self, event):
+            # Do not let unaddressed room speech interrupt a real tool or reply.
+            self.activation.speech_started(event.item_id)
+
+        async def _handle_evt_speech_stopped(self, event):
+            pass  # Wait for the final transcript before opening an assistant turn.
+
+        async def _handle_evt_input_audio_transcription_delta(self, event):
+            pass  # Unaccepted room speech must not enter local conversation history.
+
+        @staticmethod
+        def _is_voice_item(item):
+            return item.role == "user" and any(
+                part.type == "input_audio" for part in item.content or []
+            )
+
+        async def _handle_evt_conversation_item_added(self, event):
+            if self._is_voice_item(event.item):
+                decision = self._voice_decisions.get(event.item.id)
+                if decision is not True:
+                    if decision is None:
+                        self._pending_voice_items[event.item.id] = event.item
+                        if len(self._pending_voice_items) > 128:
+                            self._pending_voice_items.pop(next(iter(self._pending_voice_items)))
+                    return
+            await super()._handle_evt_conversation_item_added(event)
+
+        async def _handle_evt_conversation_item_done(self, event):
+            if self._is_voice_item(event.item):
+                decision = self._voice_decisions.get(event.item.id)
+                if decision is not True:
+                    if decision is None:
+                        self._pending_voice_items[event.item.id] = event.item
+                        if len(self._pending_voice_items) > 128:
+                            self._pending_voice_items.pop(next(iter(self._pending_voice_items)))
+                    return
+            await super()._handle_evt_conversation_item_done(event)
+
+        async def handle_evt_input_audio_transcription_completed(self, event):
+            from pipecat.frames.frames import (
+                ProposedUserStartedSpeakingFrame,
+                ProposedUserStoppedSpeakingFrame,
+            )
+            from pipecat.services.openai.realtime.events import ConversationItemDeleteEvent
+
+            if event.item_id in self._voice_decisions:
+                return  # Provider retries must not create a second response.
+            reason = self.activation.accept(event.item_id, event.transcript)
+            self._voice_decisions[event.item_id] = reason is not None
+            if len(self._voice_decisions) > 128:
+                self._voice_decisions.pop(next(iter(self._voice_decisions)))
+            item = self._pending_voice_items.pop(event.item_id, None)
+            if reason is None:
+                # Remove ignored audio from the provider's future context as well.
+                await self.send_client_event(ConversationItemDeleteEvent(item_id=event.item_id))
+                if trace is not None:
+                    trace.record("voice_turn_ignored", reason="not_invoked")
+                return
+            self._invoked = True
+            if item is not None:
+                await self._call_event_handler("on_conversation_item_created", item.id, item)
+            if trace is not None:
+                trace.record("voice_turn_accepted", reason=reason)
+            await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
+            await super().handle_evt_input_audio_transcription_completed(event)
+            self._accepted_turn_ready = True
+            await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+
+        async def _handle_user_stopped_speaking(self, frame):
+            # The aggregator processes start/interruption/transcript before this
+            # turn-end frame. Creating a response earlier races its interruption.
+            if self._accepted_turn_ready:
+                self._accepted_turn_ready = False
+                await self._create_response()
+
+        async def _handle_interruption(self):
+            from pipecat.services.openai.realtime.events import ResponseCancelEvent
+
+            if self._current_assistant_response is not None:
+                await self.send_client_event(ResponseCancelEvent())
+            await super()._handle_interruption()
 
     return ContextRealtimeService(
         api_key=key,
@@ -87,7 +206,9 @@ def create_realtime_service(
                 audio=AudioConfiguration(
                     input=AudioInput(
                         transcription=InputAudioTranscription(model="gpt-4o-mini-transcribe"),
-                        turn_detection=SemanticTurnDetection(eagerness="auto"),
+                        turn_detection=SemanticTurnDetection(
+                            eagerness="auto", create_response=False, interrupt_response=False
+                        ),
                         noise_reduction=InputAudioNoiseReduction(type=settings.noise_reduction),
                     ),
                     output=AudioOutput(voice=settings.voice),
@@ -119,6 +240,7 @@ def build_voice_pipeline(
         key,
         memory_source=trace.path.name if trace is not None else "current conversation",
         context=context,
+        trace=trace,
     )
     if trace is not None:
         from stacy.harness.tracing import attach_assistant_transcripts

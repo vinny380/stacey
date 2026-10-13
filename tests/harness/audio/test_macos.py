@@ -73,6 +73,9 @@ def test_native_bridge_requires_verified_echo_cancellation_and_closes_on_failure
 def test_barge_in_clears_actual_device_queue_and_keeps_microphone_open(tmp_path, monkeypatch):
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
     from pipecat.frames.frames import TTSAudioRawFrame, TTSStoppedFrame
+    from pipecat.services.openai.realtime.events import (
+        ConversationItemInputAudioTranscriptionCompleted,
+    )
     from pipecat.workers.runner import WorkerRunner
 
     helper, log = audio_helper(tmp_path)
@@ -115,8 +118,17 @@ def test_barge_in_clears_actual_device_queue_and_keeps_microphone_open(tmp_path,
             await eventually(lambda: len(commands(log)) == 3)
             count_during_playback = user_audio_count()
             await eventually(lambda: user_audio_count() > count_during_playback + 2)
-            # Use the real Realtime speech-start handler and Pipecat turn strategies.
-            await llm._handle_evt_speech_started(None)
+            # Only an addressed utterance may interrupt playback; room VAD alone
+            # must leave the actual device queue and the pending reply alone.
+            await llm.handle_evt_input_audio_transcription_completed(
+                ConversationItemInputAudioTranscriptionCompleted(
+                    event_id="event_barge",
+                    type="conversation.item.input_audio_transcription.completed",
+                    item_id="item_barge",
+                    content_index=0,
+                    transcript="Stacy, stop.",
+                )
+            )
             await eventually(lambda: any(c["type"] == "clear" for c in commands(log)))
             assert [c["type"] for c in commands(log)[:4]] == ["play", "play", "play", "clear"]
             await asyncio.sleep(0.08)

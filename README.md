@@ -95,10 +95,16 @@ unconfirmed and are not automatically replayed.
 
 `OPENAI_API_KEY` must be a direct OpenAI API key. Voice uses OpenAI Realtime (`STACY_REALTIME_MODEL=gpt-realtime-2.1`, `STACY_VOICE=marin`) with native turn detection and 24 kHz audio. Pipecat handles the conversation and MCP tools; separate transcription and speech-generation services are not required.
 
+Voice starts silently. Begin a request with "Stacy" or "Hey Stacey". After her
+answer finishes playing, you have five seconds to start a follow-up without
+repeating her name. After that, another named invocation is required. Room
+speech cannot start a reply or interrupt pending work outside that window.
+This gate uses Realtime transcripts; local wake-word detection remains deferred.
+
 Audio defaults to speaker mode (`STACY_AUDIO_MODE=speaker`). On macOS, Stacy uses one
 native `AVAudioEngine` for capture and playback with Apple's echo cancellation enabled.
-The microphone stays open while she speaks, so you can interrupt. Pipecat's normal
-Realtime speech detection stops the reply and clears speech queued on the audio device;
+The microphone stays open while she speaks, so you can interrupt. An addressed
+utterance stops the reply and clears speech queued on the audio device;
 capture keeps running and the next reply can play. Work sounds use the same render path.
 The internal helper is compiled and cached automatically using Apple's command line tools.
 It saves no microphone recordings and needs no browser or companion app.
