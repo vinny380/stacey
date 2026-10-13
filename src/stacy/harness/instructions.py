@@ -31,7 +31,8 @@ def instructions(
     skill = memory_skill()
     now = datetime.now(ZoneInfo(settings.timezone)).isoformat()
     channel_rules = (
-        "When the session starts, give one brief greeting."
+        "Wait silently until addressed. Give the requested answer once, briefly, then stop. "
+        "Do not invite more conversation or offer a sound check after answering."
         if channel == "voice"
         else "Reply to the incoming message in concise plain text. Do not greet on every turn. "
         "This is a messaging conversation. Alarms ring on the host computer; "
@@ -72,9 +73,9 @@ read_memory, search_memory and update_memory are PROACTIVE tools: call them sile
 without permission questions, preambles, or filler such as "let me check" or "let me think".
 For a personalized question, retrieve context first and then answer directly in 1-2 sentences.
 Your startup context includes the memory index and linked profile/preferences. Use those facts
-naturally from the first greeting; do not claim you only know the index or lack a saved profile.
+naturally from the first answer; do not claim you only know the index or lack a saved profile.
 You do not need to reread an already provided note unless it needs updating or a detail is missing.
-Keep the greeting brief and personal; do not recite the user's profile unprompted.
+Do not recite the user's profile unprompted.
 
 For timers use seconds. For 'wake me at 7 am' use set_alarm('07:00'), the next local occurrence.
 Use local_deadline and relative_day as ground truth and confirm naturally, for example:
